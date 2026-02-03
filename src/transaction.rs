@@ -521,6 +521,22 @@ impl Transaction {
 			return Err(Error::TransactionWriteOnly);
 		}
 
+        // RYOW semantics: Read your own writes. If the value is in the write set,
+        // return it.
+        if let Some(last_entry) =
+            self.write_set.get(key.as_slice()).and_then(|entries| entries.last())
+        {
+            // If the entry is a tombstone, return None.
+            if last_entry.is_tombstone() {
+                return Ok(None);
+            }
+            if let Some(v) = &last_entry.value {
+                return Ok(Some(v.clone()));
+            }
+            // If the entry has no value, it means the key was deleted in this transaction.
+            return Ok(None);
+        }
+
 		// If a timestamp is provided, use versioned read
 		if let Some(timestamp) = options.timestamp {
 			// Check if versioned queries are enabled
