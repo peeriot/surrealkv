@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::create_dir_all;
 #[cfg(not(target_os = "windows"))]
 use std::fs::File;
@@ -21,20 +21,16 @@ use crate::sstable::table::Table;
 use crate::stall::{StallCounts, StallThresholds, WriteStallCountProvider};
 use crate::task::TaskManager;
 use crate::transaction::{Mode, Transaction, TransactionOptions};
+use crate::txn_wal::{
+	recover_prepared_transactions, DecisionWalRecord, PrepareWalRecord,
+	RecoveredPreparedTransaction, TxnDecision,
+};
 use crate::vlog::{VLog, ValueLocation, ValuePointer};
 use crate::wal::recovery::{repair_corrupted_wal_segment, replay_wal};
 use crate::wal::{self, cleanup_old_segments, Wal, WalManager};
 use crate::{
-	BytewiseComparator,
-	Comparator,
-	Error,
-	FilterPolicy,
-	LSMIterator,
-	Options,
-	TimestampComparator,
-	VLogChecksumLevel,
-	Value,
-	WalRecoveryMode,
+	BytewiseComparator, Comparator, Error, FilterPolicy, Key, LSMIterator, Options,
+	TimestampComparator, VLogChecksumLevel, Value, WalRecoveryMode,
 };
 
 // ===== Compaction Operations Trait =====
@@ -56,6 +52,14 @@ pub trait CompactionOperations: Send + Sync {
 
 	/// Returns true if there are immutable memtables pending flush.
 	fn has_pending_immutables(&self) -> bool;
+}
+
+#[derive(Clone)]
+pub(crate) struct PreparedTransactionState {
+	pub(crate) batch: Batch,
+	pub(crate) should_sync: bool,
+	pub(crate) locked_keys: Vec<Key>,
+	pub(crate) wal_number: u64,
 }
 
 // ===== Core LSM Tree Implementation =====
@@ -149,6 +153,17 @@ pub(crate) struct CoreInner {
 	/// Shared with CommitPipeline for coordinated updates.
 	/// Used to set `earliest_seq` when creating new memtables for conflict detection.
 	pub(crate) visible_seq_num: Arc<AtomicU64>,
+
+	/// Per-key lock table used by prepared transactions (2PC).
+	///
+	/// Keyed by user key, value is owning transaction id.
+	pub(crate) prepared_locks: Arc<RwLock<HashMap<Key, u64>>>,
+
+	/// In-memory index of currently prepared (in-doubt) transactions.
+	pub(crate) prepared_transactions: Arc<RwLock<HashMap<u64, PreparedTransactionState>>>,
+
+	/// Monotonic transaction id generator for 2PC lock ownership.
+	next_txn_id: AtomicU64,
 }
 
 impl CoreInner {
@@ -215,11 +230,199 @@ impl CoreInner {
 			error_handler: Arc::new(BackgroundErrorHandler::new()),
 			visible_seq_num,
 			flushed_history: Arc::new(RwLock::new(None)),
+			prepared_locks: Arc::new(RwLock::new(HashMap::new())),
+			prepared_transactions: Arc::new(RwLock::new(HashMap::new())),
+			next_txn_id: AtomicU64::new(1),
 		})
 	}
 
 	pub(crate) fn immutable_count(&self) -> usize {
 		self.immutable_memtables.read().map(|imm| imm.iter().count()).unwrap_or(0)
+	}
+
+	pub(crate) fn allocate_transaction_id(&self) -> u64 {
+		self.next_txn_id.fetch_add(1, Ordering::Relaxed)
+	}
+
+	fn set_next_transaction_id_at_least(&self, min_next: u64) {
+		let mut current = self.next_txn_id.load(Ordering::Acquire);
+		while current < min_next {
+			match self.next_txn_id.compare_exchange_weak(
+				current,
+				min_next,
+				Ordering::AcqRel,
+				Ordering::Acquire,
+			) {
+				Ok(_) => break,
+				Err(actual) => current = actual,
+			}
+		}
+	}
+
+	pub(crate) fn acquire_prepare_locks<'a, I>(&self, keys: I, txn_id: u64) -> Result<()>
+	where
+		I: Iterator<Item = &'a [u8]>,
+	{
+		let keys: Vec<Key> = keys.map(|key| key.to_vec()).collect();
+		let mut prepared_locks = self.prepared_locks.write()?;
+
+		for key in &keys {
+			if let Some(owner_id) = prepared_locks.get(key) {
+				if *owner_id != txn_id {
+					return Err(Error::TransactionWriteConflict);
+				}
+			}
+		}
+
+		for key in keys {
+			prepared_locks.insert(key, txn_id);
+		}
+
+		Ok(())
+	}
+
+	pub(crate) fn track_prepared_transaction(
+		&self,
+		txn_id: u64,
+		batch: Batch,
+		should_sync: bool,
+		locked_keys: Vec<Key>,
+		wal_number: u64,
+	) -> Result<()> {
+		let mut prepared_transactions = self.prepared_transactions.write()?;
+		prepared_transactions.insert(
+			txn_id,
+			PreparedTransactionState {
+				batch,
+				should_sync,
+				locked_keys,
+				wal_number,
+			},
+		);
+		drop(prepared_transactions);
+
+		self.set_next_transaction_id_at_least(txn_id.saturating_add(1));
+		Ok(())
+	}
+
+	pub(crate) fn get_prepared_transaction(
+		&self,
+		txn_id: u64,
+	) -> Result<Option<PreparedTransactionState>> {
+		let prepared_transactions = self.prepared_transactions.read()?;
+		Ok(prepared_transactions.get(&txn_id).cloned())
+	}
+
+	pub(crate) fn remove_prepared_transaction(
+		&self,
+		txn_id: u64,
+	) -> Result<Option<PreparedTransactionState>> {
+		let mut prepared_transactions = self.prepared_transactions.write()?;
+		let state = prepared_transactions.remove(&txn_id);
+		drop(prepared_transactions);
+
+		if let Some(ref prepared) = state {
+			self.release_prepare_locks(
+				prepared.locked_keys.iter().map(|key| key.as_slice()),
+				txn_id,
+			);
+		}
+
+		Ok(state)
+	}
+
+	pub(crate) fn list_prepared_transactions(&self) -> Result<Vec<u64>> {
+		let prepared_transactions = self.prepared_transactions.read()?;
+		let mut ids: Vec<u64> = prepared_transactions.keys().copied().collect();
+		ids.sort_unstable();
+		Ok(ids)
+	}
+
+	pub(crate) fn load_recovered_prepared_transactions(
+		&self,
+		recovered: Vec<RecoveredPreparedTransaction>,
+	) -> Result<()> {
+		for prepared in recovered {
+			let locked_keys: Vec<Key> =
+				prepared.batch.entries.iter().map(|entry| entry.key.clone()).collect();
+
+			self.acquire_prepare_locks(
+				locked_keys.iter().map(|key| key.as_slice()),
+				prepared.txn_id,
+			)?;
+			self.track_prepared_transaction(
+				prepared.txn_id,
+				prepared.batch,
+				prepared.should_sync,
+				locked_keys,
+				prepared.wal_number,
+			)?;
+		}
+
+		Ok(())
+	}
+
+	fn oldest_prepared_wal_number(&self) -> Result<Option<u64>> {
+		let prepared_transactions = self.prepared_transactions.read()?;
+		Ok(prepared_transactions.values().map(|state| state.wal_number).min())
+	}
+
+	pub(crate) fn release_prepare_locks<'a, I>(&self, keys: I, txn_id: u64)
+	where
+		I: Iterator<Item = &'a [u8]>,
+	{
+		let Ok(mut prepared_locks) = self.prepared_locks.write() else {
+			return;
+		};
+
+		for key in keys {
+			if prepared_locks.get(key).copied() == Some(txn_id) {
+				prepared_locks.remove(key);
+			}
+		}
+	}
+
+	pub(crate) fn check_prepared_conflicts<'a, I>(
+		&self,
+		keys: I,
+		owner_txn_id: Option<u64>,
+	) -> Result<()>
+	where
+		I: Iterator<Item = &'a [u8]>,
+	{
+		let prepared_locks = self.prepared_locks.read()?;
+		for key in keys {
+			if let Some(owner_id) = prepared_locks.get(key) {
+				if Some(*owner_id) != owner_txn_id {
+					return Err(Error::TransactionWriteConflict);
+				}
+			}
+		}
+		Ok(())
+	}
+
+	/// Get the earliest sequence number across all memtables.
+	/// Any key with seq >= this value is guaranteed to be in memtables or flushed history.
+	pub(crate) fn get_earliest_memtable_seq(&self) -> Result<u64> {
+		// Check flushed history first (has oldest data)
+		{
+			let history = self.flushed_history.read()?;
+			if let Some(ref oldest) = *history {
+				return Ok(oldest.earliest_seq());
+			}
+		}
+
+		// Then check immutable memtables
+		{
+			let immutables = self.immutable_memtables.read()?;
+			if let Some(oldest) = immutables.first() {
+				return Ok(oldest.memtable.earliest_seq());
+			}
+		}
+
+		// Fall back to active memtable
+		let memtable = self.active_memtable.read()?;
+		Ok(memtable.earliest_seq())
 	}
 
 	pub(crate) fn l0_file_count(&self) -> usize {
@@ -529,7 +732,15 @@ impl CoreInner {
 
 		// Schedule async WAL cleanup
 		let wal_dir = self.wal.read().get_dir_path().to_path_buf();
-		let min_wal_to_keep = entry.wal_number + 1;
+		let min_wal_to_keep = {
+			let base_min_wal_to_keep = entry.wal_number + 1;
+			match self.oldest_prepared_wal_number()? {
+				Some(oldest_prepared_wal) => {
+					std::cmp::min(base_min_wal_to_keep, oldest_prepared_wal)
+				}
+				None => base_min_wal_to_keep,
+			}
+		};
 
 		tokio::spawn(async move {
 			match cleanup_old_segments(&wal_dir, min_wal_to_keep) {
@@ -963,12 +1174,8 @@ impl LsmCommitEnv {
 			task_manager: Some(task_manager),
 		})
 	}
-}
 
-impl CommitEnv for LsmCommitEnv {
-	// Write batch to WAL with inline values (synchronous operation).
-	// VLog separation is deferred to memtable flush time.
-	fn write(&self, batch: &Batch, seq_num: u64, sync: bool) -> Result<Batch> {
+	fn process_batch_for_memtable(batch: &Batch, seq_num: u64) -> Result<Batch> {
 		let mut processed_batch = Batch::new(seq_num);
 
 		for (_, entry, _current_seq_num, timestamp) in batch.entries_with_seq_nums()? {
@@ -986,6 +1193,16 @@ impl CommitEnv for LsmCommitEnv {
 			processed_batch.add_record(entry.kind, entry.key.clone(), encoded_value, timestamp)?;
 		}
 
+		Ok(processed_batch)
+	}
+}
+
+impl CommitEnv for LsmCommitEnv {
+	// Write batch to WAL with inline values (synchronous operation).
+	// VLog separation is deferred to memtable flush time.
+	fn write(&self, batch: &Batch, seq_num: u64, sync: bool) -> Result<Batch> {
+		let processed_batch = Self::process_batch_for_memtable(batch, seq_num)?;
+
 		// Write to WAL for durability
 		let enc_bytes = processed_batch.encode()?;
 		let mut wal_guard = self.core.wal.write();
@@ -996,6 +1213,10 @@ impl CommitEnv for LsmCommitEnv {
 		drop(wal_guard);
 
 		Ok(processed_batch)
+	}
+
+	fn prepare_batch(&self, batch: &Batch, seq_num: u64) -> Result<Batch> {
+		Self::process_batch_for_memtable(batch, seq_num)
 	}
 
 	/// Apply batch to memtable with retry on arena full.
@@ -1267,6 +1488,22 @@ impl Core {
 			*active_memtable = memtable;
 		}
 
+		// Recover unresolved prepared transactions from WAL and re-lock their keys.
+		// Also advance next_txn_id past ALL txn_ids seen in WAL (including resolved
+		// ones) to prevent id reuse that would shadow a new prepare behind a stale
+		// decision record for the same id.
+		let recovered = recover_prepared_transactions(&wal_path, 0)?;
+		if recovered.max_txn_id > 0 {
+			inner.set_next_transaction_id_at_least(recovered.max_txn_id + 1);
+		}
+		if !recovered.transactions.is_empty() {
+			log::warn!(
+				"Recovered {} unresolved prepared transactions from WAL",
+				recovered.transactions.len()
+			);
+			inner.load_recovered_prepared_transactions(recovered.transactions)?;
+		}
+
 		// Ensure the active memtable has the correct WAL number set
 		{
 			let active_memtable = inner.active_memtable.read()?;
@@ -1325,8 +1562,46 @@ impl Core {
 	}
 
 	pub(crate) async fn commit(&self, batch: Batch, sync: bool) -> Result<()> {
-		// Commit the batch using the commit pipeline
 		self.commit_pipeline.commit(batch, sync).await
+	}
+
+	pub(crate) async fn commit_prepared(&self, txn_id: u64, batch: Batch) -> Result<()> {
+		self.commit_pipeline
+			.commit_prepared(batch, |committed_batch| {
+				self.write_prepared_decision(txn_id, TxnDecision::Commit, committed_batch)
+			})
+			.await
+	}
+
+	/// Persist phase-1 (prepare) intent to WAL and fsync before returning.
+	///
+	/// This record is intentionally not applied to memtable and is ignored by
+	/// recovery unless a real commit record is written later.
+	pub(crate) fn write_prepare(
+		&self,
+		txn_id: u64,
+		should_sync: bool,
+		batch: &Batch,
+	) -> Result<u64> {
+		let record = PrepareWalRecord::new(txn_id, should_sync, batch.clone()).encode()?;
+		let mut wal_guard = self.inner.wal.write();
+		let wal_number = wal_guard.get_active_log_number();
+		wal_guard.append(&record)?;
+		wal_guard.sync()?;
+		Ok(wal_number)
+	}
+
+	pub(crate) fn write_prepared_decision(
+		&self,
+		txn_id: u64,
+		decision: TxnDecision,
+		committed_batch: Option<&Batch>,
+	) -> Result<()> {
+		let record = DecisionWalRecord::new(txn_id, decision, committed_batch.cloned()).encode()?;
+		let mut wal_guard = self.inner.wal.write();
+		wal_guard.append(&record)?;
+		wal_guard.sync()?;
+		Ok(())
 	}
 
 	pub(crate) fn seq_num(&self) -> u64 {
@@ -1435,7 +1710,15 @@ impl Core {
 		// When memtable flush sets log_number = current_wal + 1, cleanup would delete
 		// the active WAL if done before closing it.
 		let wal_dir = self.inner.wal.read().get_dir_path().to_path_buf();
-		let min_wal_to_keep = self.inner.level_manifest.read()?.get_log_number();
+		let min_wal_to_keep = {
+			let base_min_wal_to_keep = self.inner.level_manifest.read()?.get_log_number();
+			match self.inner.oldest_prepared_wal_number()? {
+				Some(oldest_prepared_wal) => {
+					std::cmp::min(base_min_wal_to_keep, oldest_prepared_wal)
+				}
+				None => base_min_wal_to_keep,
+			}
+		};
 
 		log::debug!("Cleaning up obsolete WAL files (min_wal_to_keep={})", min_wal_to_keep);
 
@@ -1538,6 +1821,43 @@ impl Tree {
 	pub fn begin_with_opts(&self, opts: TransactionOptions) -> Result<Transaction> {
 		let txn = Transaction::new(Arc::clone(&self.core), opts)?;
 		Ok(txn)
+	}
+
+	/// Lists unresolved prepared transaction ids recovered from WAL.
+	pub fn list_prepared_transactions(&self) -> Result<Vec<u64>> {
+		self.core.inner.list_prepared_transactions()
+	}
+
+	/// Commits a prepared transaction that was recovered from WAL.
+	pub async fn commit_prepared_transaction(&self, txn_id: u64) -> Result<()> {
+		let prepared = self
+			.core
+			.inner
+			.get_prepared_transaction(txn_id)?
+			.ok_or(Error::TransactionNotPrepared)?;
+
+		let _ = prepared.should_sync;
+		self.core.commit_prepared(txn_id, prepared.batch.clone()).await.map_err(|err| {
+			Error::CommitFail(format!("failed to finalize 2PC commit: {}", err))
+		})?;
+		// remove_prepared_transaction is called ONLY on success so that a failed commit
+		// (e.g. transient WAL write error) leaves the in-memory state intact, allowing
+		// the coordinator to retry or, after restart, recover the transaction from WAL.
+		let _ = self.core.inner.remove_prepared_transaction(txn_id);
+		Ok(())
+	}
+
+	/// Aborts a prepared transaction that was recovered from WAL.
+	pub fn rollback_prepared_transaction(&self, txn_id: u64) -> Result<()> {
+		let _prepared = self
+			.core
+			.inner
+			.get_prepared_transaction(txn_id)?
+			.ok_or(Error::TransactionNotPrepared)?;
+
+		self.core.write_prepared_decision(txn_id, TxnDecision::Abort, None)?;
+		let _ = self.core.inner.remove_prepared_transaction(txn_id)?;
+		Ok(())
 	}
 
 	/// Executes a read-only operation in a consistent snapshot.
@@ -1646,6 +1966,18 @@ impl Tree {
 		if let Some(memtable) = recovered_memtable {
 			let mut active_memtable = self.core.inner.active_memtable.write()?;
 			*active_memtable = memtable;
+		}
+
+		let recovered = recover_prepared_transactions(&wal_path, 0)?;
+		if recovered.max_txn_id > 0 {
+			self.core.inner.set_next_transaction_id_at_least(recovered.max_txn_id + 1);
+		}
+		if !recovered.transactions.is_empty() {
+			log::warn!(
+				"Restore: recovered {} unresolved prepared transactions from WAL",
+				recovered.transactions.len()
+			);
+			self.core.inner.load_recovered_prepared_transactions(recovered.transactions)?;
 		}
 
 		// Ensure the active memtable has the correct WAL number set

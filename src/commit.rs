@@ -19,6 +19,9 @@ pub trait CommitEnv: Send + Sync + 'static {
 	// Returns a new batch with VLog pointers applied
 	fn write(&self, batch: &Batch, seq_num: u64, sync: bool) -> Result<Batch>;
 
+	// Process a batch for memtable application without writing it to WAL.
+	fn prepare_batch(&self, batch: &Batch, seq_num: u64) -> Result<Batch>;
+
 	// Apply processed batch to memtable
 	fn apply(&self, batch: &Batch) -> Result<()>;
 
@@ -274,27 +277,39 @@ impl CommitPipeline {
 		//   Entries for sequence numbers 4,5,6 do not exist in the memtable.
 		// =========================================================================
 
-		commit_batch.mark_applied();
+		self.finish_and_wait(commit_batch, complete_rx, apply_result).await
+	}
 
-		// If apply failed, send error to waiter now (before publish)
-		let apply_err = if let Err(ref e) = apply_result {
-			let err = Error::CommitFail(e.to_string());
-			commit_batch.complete(Err(err.clone()));
-			Some(err)
-		} else {
-			None
-		};
-
-		// Phase 3: Publish (multi-consumer) - MUST always run to drain queue
-		self.publish();
-
-		// Return error if apply failed
-		if let Some(err) = apply_err {
-			return Err(err);
+	pub(crate) async fn commit_prepared<F>(
+		&self,
+		mut batch: Batch,
+		mut persist_decision: F,
+	) -> Result<()>
+	where
+		F: FnMut(Option<&Batch>) -> Result<()>,
+	{
+		if self.shutdown.load(Ordering::Acquire) {
+			return Err(Error::PipelineStall);
 		}
 
-		// Wait for completion
-		complete_rx.await.map_err(|_| Error::PipelineStall)?
+		self.env.check_background_error()?;
+
+		if batch.is_empty() {
+			persist_decision(None)?;
+			return Ok(());
+		}
+
+		let _permit = self.commit_sem.acquire().await.map_err(|_| Error::PipelineStall)?;
+		let (commit_batch, complete_rx) = CommitBatch::new(batch.count());
+
+		let processed_batch =
+			self.prepare_prepared(&mut batch, Arc::clone(&commit_batch), &mut persist_decision)?;
+		let apply_result = {
+			let env = Arc::clone(&self.env);
+			env.apply(&processed_batch)
+		};
+
+		self.finish_and_wait(commit_batch, complete_rx, apply_result).await
 	}
 
 	fn prepare(
@@ -320,6 +335,60 @@ impl CommitPipeline {
 		let processed_batch = self.env.write(batch, seq_num, sync)?;
 
 		Ok(processed_batch)
+	}
+
+	fn prepare_prepared<F>(
+		&self,
+		batch: &mut Batch,
+		commit_batch: Arc<CommitBatch>,
+		persist_decision: &mut F,
+	) -> Result<Batch>
+	where
+		F: FnMut(Option<&Batch>) -> Result<()>,
+	{
+		let _guard = self.write_mutex.lock();
+
+		let count = batch.count() as u64;
+		let seq_num = self.log_seq_num.fetch_add(count, Ordering::SeqCst);
+
+		commit_batch.set_seq_num(seq_num);
+		batch.set_starting_seq_num(seq_num);
+
+		let processed_batch = self.env.prepare_batch(batch, seq_num)?;
+
+		// Persist the phase-2 decision while holding the write lock so sequence
+		// assignment and WAL ordering stay coupled.
+		persist_decision(Some(&processed_batch))?;
+
+		// Enqueue only after decision+batch processing succeeds to avoid zombie slots.
+		self.pending.enqueue(commit_batch);
+
+		Ok(processed_batch)
+	}
+
+	async fn finish_and_wait(
+		&self,
+		commit_batch: Arc<CommitBatch>,
+		complete_rx: oneshot::Receiver<Result<()>>,
+		apply_result: Result<()>,
+	) -> Result<()> {
+		commit_batch.mark_applied();
+
+		let apply_err = if let Err(ref e) = apply_result {
+			let err = Error::CommitFail(e.to_string());
+			commit_batch.complete(Err(err.clone()));
+			Some(err)
+		} else {
+			None
+		};
+
+		self.publish();
+
+		if let Some(err) = apply_err {
+			return Err(err);
+		}
+
+		complete_rx.await.map_err(|_| Error::PipelineStall)?
 	}
 
 	fn publish(&self) {
@@ -427,6 +496,10 @@ mod tests {
 				)?;
 			}
 			Ok(new_batch)
+		}
+
+		fn prepare_batch(&self, batch: &Batch, seq_num: u64) -> Result<Batch> {
+			self.write(batch, seq_num, false)
 		}
 
 		fn apply(&self, _batch: &Batch) -> Result<()> {
@@ -547,6 +620,10 @@ mod tests {
 			Ok(new_batch)
 		}
 
+		fn prepare_batch(&self, batch: &Batch, seq_num: u64) -> Result<Batch> {
+			self.write(batch, seq_num, false)
+		}
+
 		fn apply(&self, _batch: &Batch) -> Result<()> {
 			let start = std::time::Instant::now();
 			while start.elapsed() < Duration::from_micros(50) {
@@ -630,6 +707,10 @@ mod tests {
 			Ok(new_batch)
 		}
 
+		fn prepare_batch(&self, batch: &Batch, seq_num: u64) -> Result<Batch> {
+			self.write(batch, seq_num, false)
+		}
+
 		fn apply(&self, _batch: &Batch) -> Result<()> {
 			Err(Error::CommitFail("simulated apply failure".into()))
 		}
@@ -697,6 +778,10 @@ mod tests {
 				)?;
 			}
 			Ok(new_batch)
+		}
+
+		fn prepare_batch(&self, batch: &Batch, seq_num: u64) -> Result<Batch> {
+			self.write(batch, seq_num, false)
 		}
 
 		fn apply(&self, _batch: &Batch) -> Result<()> {

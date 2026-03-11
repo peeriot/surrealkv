@@ -7,11 +7,8 @@ use test_log::test;
 
 use crate::lsm::Tree;
 use crate::test::{
-	collect_history_all,
-	collect_transaction_all,
-	collect_transaction_reverse,
-	point_in_time_from_history,
-	KeyVersionsMap,
+	collect_history_all, collect_transaction_all, collect_transaction_reverse,
+	point_in_time_from_history, KeyVersionsMap,
 };
 use crate::transaction::HistoryOptions;
 use crate::{Error, Key, LSMIterator, Mode, Options, TreeBuilder, WriteOptions};
@@ -3739,4 +3736,425 @@ async fn test_direction_switch_after_seek() {
 	// Call prev() - should return "b", not "e"
 	assert!(iter.prev().unwrap(), "prev from 'c' should succeed");
 	assert_eq!(iter.key().user_key(), b"b", "After prev() from seek('c'), should be at 'b'");
+}
+
+#[test(tokio::test)]
+async fn test_two_phase_commit_prepare_commit() {
+	let (store, _temp_dir) = create_store();
+
+	let mut prepared_tx = store.begin().unwrap();
+	prepared_tx.set(b"k", b"v1").unwrap();
+	prepared_tx.prepare().unwrap();
+
+	// A concurrent transaction touching the same key must fail while tx is prepared.
+	let mut conflicting_tx = store.begin().unwrap();
+	conflicting_tx.set(b"k", b"v2").unwrap();
+	let result = conflicting_tx.commit().await;
+	assert!(
+		matches!(result, Err(Error::TransactionWriteConflict)),
+		"Expected TransactionWriteConflict, got: {:?}",
+		result
+	);
+
+	prepared_tx.commit_prepared().await.unwrap();
+
+	let verify = store.begin().unwrap();
+	assert_eq!(verify.get(b"k").unwrap().unwrap(), b"v1".to_vec());
+}
+
+#[test(tokio::test)]
+async fn test_two_phase_commit_prepare_rollback() {
+	let (store, _temp_dir) = create_store();
+
+	let mut prepared_tx = store.begin().unwrap();
+	prepared_tx.set(b"k", b"v1").unwrap();
+	prepared_tx.prepare().unwrap();
+	prepared_tx.rollback_prepared().unwrap();
+
+	let mut writer_tx = store.begin().unwrap();
+	writer_tx.set(b"k", b"v2").unwrap();
+	writer_tx.commit().await.unwrap();
+
+	let verify = store.begin().unwrap();
+	assert_eq!(verify.get(b"k").unwrap().unwrap(), b"v2".to_vec());
+}
+
+#[test(tokio::test)]
+async fn test_two_phase_prepare_blocks_further_ops() {
+	let (store, _temp_dir) = create_store();
+
+	let mut tx = store.begin().unwrap();
+	tx.set(b"k", b"v1").unwrap();
+	tx.prepare().unwrap();
+
+	let set_result = tx.set(b"k2", b"v2");
+	assert!(
+		matches!(set_result, Err(Error::TransactionPrepared)),
+		"Expected TransactionPrepared, got: {:?}",
+		set_result
+	);
+
+	let get_result = tx.get(b"k");
+	assert!(
+		matches!(get_result, Err(Error::TransactionPrepared)),
+		"Expected TransactionPrepared, got: {:?}",
+		get_result
+	);
+
+	// `commit()` on a prepared transaction should execute phase 2.
+	tx.commit().await.unwrap();
+}
+
+#[test(tokio::test)]
+async fn test_one_phase_commit_does_not_emit_2pc_metadata_records() {
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	let store =
+		TreeBuilder::new().with_path(path.clone()).with_flush_on_close(false).build().unwrap();
+	let mut tx = store.begin().unwrap();
+	tx.set(b"k", b"v1").unwrap();
+	tx.commit().await.unwrap();
+
+	store.close().await.unwrap();
+	drop(store);
+
+	let wal_dir = path.join("wal");
+	let segments =
+		crate::wal::SegmentRef::read_segments_from_directory(&wal_dir, Some("wal")).unwrap();
+	assert!(!segments.is_empty());
+
+	let mut wal_record_count = 0usize;
+	for segment in segments {
+		let file = std::fs::File::open(&segment.file_path).unwrap();
+		let mut reader = crate::wal::reader::Reader::new(file);
+
+		loop {
+			match reader.read() {
+				Ok((record_data, _offset)) => {
+					wal_record_count += 1;
+					assert!(
+						!crate::txn_wal::TxnWalRecord::is_txn_record(record_data),
+						"normal commit should not emit 2PC metadata records"
+					);
+				}
+				Err(crate::wal::Error::IO(err))
+					if err.kind() == std::io::ErrorKind::UnexpectedEof =>
+				{
+					break;
+				}
+				Err(err) => {
+					panic!("failed reading WAL segment {}: {}", segment.id, err);
+				}
+			}
+		}
+	}
+
+	assert!(wal_record_count > 0);
+}
+
+#[test(tokio::test)]
+async fn test_two_phase_prepare_is_durable_but_not_visible_after_restart() {
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	let store = TreeBuilder::new().with_path(path.clone()).build().unwrap();
+
+	let mut prepared_tx = store.begin().unwrap();
+	prepared_tx.set(b"k", b"v1").unwrap();
+	prepared_tx.prepare().unwrap();
+
+	// Close cleanly to ensure buffers are flushed for the restart check.
+	store.close().await.unwrap();
+	drop(store);
+
+	// Reopen and verify prepare-only data is not yet visible, but recoverable.
+	let reopened = TreeBuilder::new().with_path(path).build().unwrap();
+	let prepared = reopened.list_prepared_transactions().unwrap();
+	assert_eq!(prepared.len(), 1);
+
+	{
+		let reader = reopened.begin().unwrap();
+		assert!(reader.get(b"k").unwrap().is_none());
+	}
+
+	reopened.commit_prepared_transaction(prepared[0]).await.unwrap();
+
+	let reader = reopened.begin().unwrap();
+	assert_eq!(reader.get(b"k").unwrap().unwrap(), b"v1".to_vec());
+
+	reopened.close().await.unwrap();
+}
+
+#[test(tokio::test)]
+async fn test_two_phase_recovered_prepare_can_be_rolled_back() {
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	let store = TreeBuilder::new().with_path(path.clone()).build().unwrap();
+	let mut prepared_tx = store.begin().unwrap();
+	prepared_tx.set(b"k", b"v1").unwrap();
+	prepared_tx.prepare().unwrap();
+	store.close().await.unwrap();
+	drop(store);
+
+	let reopened = TreeBuilder::new().with_path(path).build().unwrap();
+	let prepared = reopened.list_prepared_transactions().unwrap();
+	assert_eq!(prepared.len(), 1);
+
+	reopened.rollback_prepared_transaction(prepared[0]).unwrap();
+
+	let reader = reopened.begin().unwrap();
+	assert!(reader.get(b"k").unwrap().is_none());
+
+	reopened.close().await.unwrap();
+}
+
+#[test(tokio::test)]
+async fn test_two_phase_committed_prepare_replays_after_restart() {
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	let store = TreeBuilder::new().with_path(path.clone()).build().unwrap();
+	let mut prepared_tx = store.begin().unwrap();
+	prepared_tx.set(b"k", b"v1").unwrap();
+	prepared_tx.prepare().unwrap();
+	prepared_tx.commit_prepared().await.unwrap();
+
+	store.close().await.unwrap();
+	drop(store);
+
+	let reopened = TreeBuilder::new().with_path(path).build().unwrap();
+	assert!(reopened.list_prepared_transactions().unwrap().is_empty());
+
+	let reader = reopened.begin().unwrap();
+	assert_eq!(reader.get(b"k").unwrap().unwrap(), b"v1".to_vec());
+
+	reopened.close().await.unwrap();
+}
+
+#[test(tokio::test)]
+async fn test_two_phase_prepare_survives_flush_cleanup_restart() {
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	let store = TreeBuilder::new()
+		.with_path(path.clone())
+		.with_max_memtable_size(64 * 1024)
+		.build()
+		.unwrap();
+
+	let mut prepared_tx = store.begin().unwrap();
+	prepared_tx.set(b"prepared-key", b"prepared-value").unwrap();
+	prepared_tx.prepare().unwrap();
+	drop(prepared_tx);
+
+	let prepared_before = store.list_prepared_transactions().unwrap();
+	assert_eq!(prepared_before.len(), 1);
+
+	let mut writer_tx = store.begin().unwrap();
+	writer_tx.set(b"other-key", b"other-value").unwrap();
+	writer_tx.commit().await.unwrap();
+
+	// Force a rotate+flush path that would normally advance manifest log_number and
+	// clean old WAL files.
+	store.flush().unwrap();
+	store.close().await.unwrap();
+	drop(store);
+
+	let reopened =
+		TreeBuilder::new().with_path(path).with_max_memtable_size(64 * 1024).build().unwrap();
+
+	let prepared_after = reopened.list_prepared_transactions().unwrap();
+	assert_eq!(prepared_after.len(), 1);
+
+	reopened.commit_prepared_transaction(prepared_after[0]).await.unwrap();
+
+	let reader = reopened.begin().unwrap();
+	assert_eq!(reader.get(b"prepared-key").unwrap().unwrap(), b"prepared-value".to_vec());
+
+	reopened.close().await.unwrap();
+}
+
+// Verify that a rollback decision is durable: after rolling back a recovered prepared
+// transaction, closing, and reopening, the transaction must NOT reappear in the prepared list.
+// The existing test_two_phase_recovered_prepare_can_be_rolled_back only checks the key is
+// invisible in the same session; this test verifies the abort WAL record survives a restart.
+#[test(tokio::test)]
+async fn test_two_phase_rollback_decision_is_durable_across_restart() {
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	// Session 1: prepare a transaction and close without deciding.
+	{
+		let store = TreeBuilder::new().with_path(path.clone()).build().unwrap();
+		let mut tx = store.begin().unwrap();
+		tx.set(b"k", b"v1").unwrap();
+		tx.prepare().unwrap();
+		store.close().await.unwrap();
+	}
+
+	// Session 2: recover the prepared transaction, roll it back, then close.
+	{
+		let store = TreeBuilder::new().with_path(path.clone()).build().unwrap();
+		let prepared = store.list_prepared_transactions().unwrap();
+		assert_eq!(prepared.len(), 1, "prepared tx must survive first restart");
+		store.rollback_prepared_transaction(prepared[0]).unwrap();
+		store.close().await.unwrap();
+	}
+
+	// Session 3: the abort decision must be durable — the transaction must not reappear.
+	{
+		let store = TreeBuilder::new().with_path(path.clone()).build().unwrap();
+		let prepared = store.list_prepared_transactions().unwrap();
+		assert!(
+			prepared.is_empty(),
+			"rollback decision must be durable: tx reappeared after second restart"
+		);
+		let reader = store.begin().unwrap();
+		assert!(reader.get(b"k").unwrap().is_none(), "rolled-back key must not be visible");
+		store.close().await.unwrap();
+	}
+}
+
+// Verify the success-path cleanup of commit_prepared_transaction: after a successful commit the
+// entry is removed from the in-memory index exactly once, and a second call returns
+// TransactionNotPrepared rather than panicking or silently succeeding.
+//
+// NOTE: the failure-path fix (remove_prepared_transaction must NOT be called when commit fails,
+// so the coordinator can retry or recover on restart) cannot be covered by an integration test
+// without WAL-write failure injection. It is covered by code inspection and the comment in
+// commit_prepared_transaction.
+#[test(tokio::test)]
+async fn test_commit_prepared_transaction_cleans_up_exactly_on_success() {
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	let store = TreeBuilder::new().with_path(path.clone()).build().unwrap();
+	let mut tx = store.begin().unwrap();
+	tx.set(b"k", b"v1").unwrap();
+	tx.prepare().unwrap();
+	let txn_id = store.list_prepared_transactions().unwrap()[0];
+
+	// First call must succeed.
+	store.commit_prepared_transaction(txn_id).await.unwrap();
+
+	// Immediately after success the entry must be gone from the in-memory index.
+	assert!(
+		store.list_prepared_transactions().unwrap().is_empty(),
+		"prepared tx must be removed from list after successful commit"
+	);
+
+	// A second call on the same id must return an error (not panic or silently succeed).
+	let second_result = store.commit_prepared_transaction(txn_id).await;
+	assert!(
+		matches!(second_result, Err(Error::TransactionNotPrepared)),
+		"second commit_prepared_transaction call must return TransactionNotPrepared, got: {:?}",
+		second_result
+	);
+
+	// Data must be visible.
+	let reader = store.begin().unwrap();
+	assert_eq!(reader.get(b"k").unwrap().unwrap(), b"v1".to_vec());
+
+	store.close().await.unwrap();
+}
+
+// Regression test for txn_id reuse across restarts.
+//
+// Without the fix, the following sequence loses TX D:
+//   Session 1: TX A(id=1) commit, TX B(id=2) prepare-only, TX C(id=3) commit → crash
+//   Recovery:  only TX B(id=2) recovered → next_txn_id set to 3
+//   Session 2: TX D gets id=3 (reuse!) → prepare → crash
+//   Recovery:  old decision(3) resolves the id → TX D's prepare(3) SKIPPED → data lost
+//
+// The fix: advance next_txn_id past the highest id seen in ANY WAL record (including
+// resolved ones), so TX D gets id=4 instead.
+#[test(tokio::test)]
+async fn test_txn_id_not_reused_across_restarts() {
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	// Session 1: commit TX A (id=1), prepare TX B (id=2), commit TX C (id=3).
+	// Leave TX B unresolved so its WAL segment is retained.
+	{
+		let store = TreeBuilder::new()
+			.with_path(path.clone())
+			.with_flush_on_close(false)
+			.build()
+			.unwrap();
+
+		// TX A — committed
+		let mut tx_a = store.begin().unwrap();
+		tx_a.set(b"a", b"a_val").unwrap();
+		tx_a.prepare().unwrap();
+		tx_a.commit_prepared().await.unwrap();
+
+		// TX B — prepared only, left in-doubt
+		let mut tx_b = store.begin().unwrap();
+		tx_b.set(b"b", b"b_val").unwrap();
+		tx_b.prepare().unwrap();
+		drop(tx_b); // drops handle without deciding; state stays in-doubt
+
+		// TX C — committed (gets id=3)
+		let mut tx_c = store.begin().unwrap();
+		tx_c.set(b"c", b"c_val").unwrap();
+		tx_c.prepare().unwrap();
+		tx_c.commit_prepared().await.unwrap();
+
+		store.close().await.unwrap();
+	}
+
+	// Session 2: recover TX B. Open new TX D, prepare it, then close.
+	// Before the fix, TX D could get id=3 (reusing TX C's old id).
+	{
+		let store = TreeBuilder::new()
+			.with_path(path.clone())
+			.with_flush_on_close(false)
+			.build()
+			.unwrap();
+
+		let prepared = store.list_prepared_transactions().unwrap();
+		assert_eq!(prepared.len(), 1, "only TX B should be in-doubt");
+
+		// TX D — new prepared transaction
+		let mut tx_d = store.begin().unwrap();
+		tx_d.set(b"d", b"d_val").unwrap();
+		tx_d.prepare().unwrap();
+		drop(tx_d);
+
+		let prepared = store.list_prepared_transactions().unwrap();
+		assert_eq!(prepared.len(), 2, "TX B and TX D should both be in-doubt");
+
+		store.close().await.unwrap();
+	}
+
+	// Session 3: recover. Both TX B and TX D must be in-doubt.
+	// Before the fix, TX D would be lost because its id collided with TX C's.
+	{
+		let store = TreeBuilder::new()
+			.with_path(path.clone())
+			.with_flush_on_close(false)
+			.build()
+			.unwrap();
+
+		let prepared = store.list_prepared_transactions().unwrap();
+		assert_eq!(
+			prepared.len(),
+			2,
+			"both TX B and TX D must survive recovery (got {:?})",
+			prepared
+		);
+
+		// Commit both and verify data
+		for txn_id in &prepared {
+			store.commit_prepared_transaction(*txn_id).await.unwrap();
+		}
+
+		let reader = store.begin().unwrap();
+		assert!(reader.get(b"b").unwrap().is_some(), "TX B data must be present");
+		assert!(reader.get(b"d").unwrap().is_some(), "TX D data must be present");
+
+		store.close().await.unwrap();
+	}
 }

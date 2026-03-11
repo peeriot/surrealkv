@@ -189,6 +189,12 @@ impl HistoryOptions {
 	}
 }
 
+struct PreparedCommit {
+	batch: Batch,
+	should_sync: bool,
+	locked_keys: Vec<Key>,
+}
+
 // ===== Transaction Implementation =====
 /// A transaction in the LSM tree providing ACID guarantees.
 pub struct Transaction {
@@ -218,6 +224,10 @@ pub struct Transaction {
 	/// cannot make any more changes to the data.
 	closed: bool,
 
+	/// A prepared transaction has completed phase 1 and is waiting for a
+	/// coordinator decision (phase 2).
+	prepared: Option<PreparedCommit>,
+
 	/// The sequence number when this transaction started.
 	pub(crate) start_seq_num: u64,
 
@@ -228,9 +238,29 @@ pub struct Transaction {
 	/// write sequence number is used for real-time ordering of writes within a
 	/// transaction.
 	write_seqno: u32,
+
+	/// Stable id used to own prepared key locks in `CoreInner`.
+	txn_id: u64,
 }
 
 impl Transaction {
+	fn ensure_active(&self) -> Result<()> {
+		if self.closed {
+			return Err(Error::TransactionClosed);
+		}
+		if self.prepared.is_some() {
+			return Err(Error::TransactionPrepared);
+		}
+		Ok(())
+	}
+
+	fn ensure_not_closed(&self) -> Result<()> {
+		if self.closed {
+			return Err(Error::TransactionClosed);
+		}
+		Ok(())
+	}
+
 	/// Bump the write sequence number and return it.
 	fn next_write_seqno(&mut self) -> u32 {
 		self.write_seqno += 1;
@@ -257,6 +287,7 @@ impl Transaction {
 
 		// Get the current visible sequence number as our start point.
 		let start_seq_num = core.seq_num();
+		let txn_id = core.inner.allocate_transaction_id();
 
 		let mut snapshot = None;
 		if !mode.is_write_only() {
@@ -270,9 +301,11 @@ impl Transaction {
 			write_set: BTreeMap::new(),
 			durability,
 			closed: false,
+			prepared: None,
 			start_seq_num,
 			savepoints: 0,
 			write_seqno: 0,
+			txn_id,
 		})
 	}
 
@@ -402,10 +435,7 @@ impl Transaction {
 	where
 		K: IntoBytes,
 	{
-		// If the transaction is closed, return an error.
-		if self.closed {
-			return Err(Error::TransactionClosed);
-		}
+		self.ensure_active()?;
 		// If the key is empty, return an error.
 		if key.as_slice().is_empty() {
 			return Err(Error::EmptyKey);
@@ -453,10 +483,7 @@ impl Transaction {
 	where
 		K: IntoBytes,
 	{
-		// If the transaction is closed, return an error.
-		if self.closed {
-			return Err(Error::TransactionClosed);
-		}
+		self.ensure_active()?;
 		// If the key is empty, return an error.
 		if key.as_slice().is_empty() {
 			return Err(Error::EmptyKey);
@@ -507,7 +534,7 @@ impl Transaction {
 	///
 	/// # Example
 	/// ```ignore
-	/// 
+	///
 	/// let mut iter = tx.range(b"a", b"z")?;
 	/// iter.seek_first()?;
 	/// while iter.valid() {
@@ -591,9 +618,7 @@ impl Transaction {
 	where
 		K: IntoBytes,
 	{
-		if self.closed {
-			return Err(Error::TransactionClosed);
-		}
+		self.ensure_active()?;
 		if self.mode.is_write_only() {
 			return Err(Error::TransactionWriteOnly);
 		}
@@ -659,10 +684,7 @@ impl Transaction {
 		if !self.mode.mutable() {
 			return Err(Error::TransactionReadOnly);
 		}
-		// If the transaction is closed, return an error.
-		if self.closed {
-			return Err(Error::TransactionClosed);
-		}
+		self.ensure_active()?;
 		// If the key is empty, return an error.
 		if e.key.is_empty() {
 			return Err(Error::EmptyKey);
@@ -715,43 +737,30 @@ impl Transaction {
 		Ok(())
 	}
 
-	/// Commits the transaction, by writing all pending entries to the store.
-	pub async fn commit(&mut self) -> Result<()> {
-		// If the transaction is closed, return an error.
-		if self.closed {
-			return Err(Error::TransactionClosed);
+	fn collect_write_keys(&self) -> Vec<Key> {
+		self.write_set.keys().cloned().collect()
+	}
+
+	fn acquire_write_locks(&self, keys: &[Key]) -> Result<()> {
+		self.core.inner.acquire_prepare_locks(keys.iter().map(|key| key.as_slice()), self.txn_id)
+	}
+
+	fn release_write_locks(&self, keys: &[Key]) {
+		if keys.is_empty() {
+			return;
 		}
+		self.core.inner.release_prepare_locks(keys.iter().map(|key| key.as_slice()), self.txn_id);
+	}
 
-		// If the transaction is read-only, return an error.
-		if self.mode.is_read_only() {
-			return Err(Error::TransactionReadOnly);
-		}
-
-		// If there are no pending writes, there's nothing to commit, so return early.
-		if self.write_set.is_empty() {
-			self.closed = true;
-			return Ok(());
-		}
-
-		// This checks if any key in our write set was modified after we started.
-		self.validate_write_conflicts()?;
-
-		// Create and prepare batch directly
+	fn build_commit_batch(&self) -> Result<Batch> {
 		let mut batch = Batch::new(0);
-
-		// Extract the vector of entries for the current transaction,
-		// respecting the insertion order recorded with Entry::seqno.
-		let mut latest_writes: Vec<Entry> =
-			std::mem::take(&mut self.write_set).into_values().flatten().collect();
+		let mut latest_writes: Vec<Entry> = self.write_set.values().flatten().cloned().collect();
 		latest_writes.sort_by_key(|a| a.seqno);
 
-		// Generate a single timestamp for this commit
+		// Generate a single timestamp for this commit.
 		let commit_timestamp = self.core.opts.clock.now();
 
-		// Add all entries to the batch
 		for entry in latest_writes {
-			// Use the entry's timestamp if it was explicitly set (via set_at),
-			// otherwise use the commit timestamp
 			let timestamp = if entry.timestamp != Entry::COMMIT_TIME {
 				entry.timestamp
 			} else {
@@ -760,29 +769,198 @@ impl Transaction {
 			batch.add_record(entry.kind, entry.key, entry.value, timestamp)?;
 		}
 
-		// Write the batch to storage
-		let should_sync = self.durability == Durability::Immediate;
-		self.core.commit(batch, should_sync).await?;
+		Ok(batch)
+	}
 
-		// Mark the transaction as closed
+	fn close_transaction(&mut self) {
 		self.closed = true;
+		self.prepared = None;
+		self.write_set.clear();
+		self.snapshot.take();
+		self.savepoints = 0;
+		self.write_seqno = 0;
+	}
+
+	/// Phase 1 of two-phase commit.
+	///
+	/// Validates conflicts, acquires per-key prepare locks, and freezes the
+	/// final commit batch. The transaction remains pending until
+	/// [`commit_prepared`](Self::commit_prepared) or
+	/// [`rollback_prepared`](Self::rollback_prepared) is called.
+	///
+	/// Phase 1 is made durable by appending a prepare-intent record to WAL and
+	/// fsyncing before returning.
+	pub fn prepare(&mut self) -> Result<()> {
+		self.ensure_active()?;
+		if self.mode.is_read_only() {
+			return Err(Error::TransactionReadOnly);
+		}
+		if self.write_set.is_empty() {
+			self.prepared = Some(PreparedCommit {
+				batch: Batch::new(0),
+				should_sync: self.durability == Durability::Immediate,
+				locked_keys: Vec::new(),
+			});
+			return Ok(());
+		}
+
+		let locked_keys = self.collect_write_keys();
+		self.acquire_write_locks(&locked_keys)?;
+
+		if let Err(err) = self.validate_write_conflicts() {
+			self.release_write_locks(&locked_keys);
+			return Err(err);
+		}
+
+		let batch = match self.build_commit_batch() {
+			Ok(batch) => batch,
+			Err(err) => {
+				self.release_write_locks(&locked_keys);
+				return Err(err);
+			}
+		};
+
+		let should_sync = self.durability == Durability::Immediate;
+		let wal_number = match self.core.write_prepare(self.txn_id, should_sync, &batch) {
+			Ok(wal_number) => wal_number,
+			Err(err) => {
+				self.release_write_locks(&locked_keys);
+				return Err(err);
+			}
+		};
+
+		if let Err(err) = self.core.inner.track_prepared_transaction(
+			self.txn_id,
+			batch.clone(),
+			should_sync,
+			locked_keys.clone(),
+			wal_number,
+		) {
+			self.release_write_locks(&locked_keys);
+			return Err(err);
+		}
+
+		self.prepared = Some(PreparedCommit {
+			batch,
+			should_sync,
+			locked_keys,
+		});
+
+		Ok(())
+	}
+
+	/// Phase 2 of two-phase commit.
+	///
+	/// Applies a previously prepared transaction.
+	pub async fn commit_prepared(&mut self) -> Result<()> {
+		self.ensure_not_closed()?;
+
+		let (batch, should_sync) = {
+			let prepared = self.prepared.as_ref().ok_or(Error::TransactionNotPrepared)?;
+			(prepared.batch.clone(), prepared.should_sync)
+		};
+
+		// `should_sync` is persisted in the prepare record and used during recovery.
+		let _ = should_sync;
+		self.core.commit_prepared(self.txn_id, batch).await?;
+		let _ = self.core.inner.remove_prepared_transaction(self.txn_id);
+
+		if let Some(prepared) = self.prepared.take() {
+			self.release_write_locks(&prepared.locked_keys);
+		}
+		self.close_transaction();
+		Ok(())
+	}
+
+	/// Aborts a previously prepared transaction and releases all prepare locks.
+	pub fn rollback_prepared(&mut self) -> Result<()> {
+		self.ensure_not_closed()?;
+		let prepared = self.prepared.take().ok_or(Error::TransactionNotPrepared)?;
+		self.core.write_prepared_decision(self.txn_id, crate::txn_wal::TxnDecision::Abort, None)?;
+		let _ = self.core.inner.remove_prepared_transaction(self.txn_id);
+		self.release_write_locks(&prepared.locked_keys);
+		self.close_transaction();
+		Ok(())
+	}
+
+	/// Commits the transaction, by writing all pending entries to the store.
+	///
+	/// If the transaction was explicitly prepared, this executes phase 2.
+	/// Otherwise it uses a one-phase fast path.
+	pub async fn commit(&mut self) -> Result<()> {
+		if self.prepared.is_some() {
+			return self.commit_prepared().await;
+		}
+
+		self.ensure_active()?;
+		if self.mode.is_read_only() {
+			return Err(Error::TransactionReadOnly);
+		}
+		if self.write_set.is_empty() {
+			self.close_transaction();
+			return Ok(());
+		}
+
+		let locked_keys = self.collect_write_keys();
+		self.acquire_write_locks(&locked_keys)?;
+
+		if let Err(err) = self.validate_write_conflicts() {
+			self.release_write_locks(&locked_keys);
+			return Err(err);
+		}
+
+		let batch = match self.build_commit_batch() {
+			Ok(batch) => batch,
+			Err(err) => {
+				self.release_write_locks(&locked_keys);
+				return Err(err);
+			}
+		};
+
+		let should_sync = self.durability == Durability::Immediate;
+		let commit_result = self.core.commit(batch, should_sync).await;
+		self.release_write_locks(&locked_keys);
+		commit_result?;
+
+		self.close_transaction();
 		Ok(())
 	}
 
 	/// Validates that no key in our write set was modified after we started.
 	/// Only checks memtables - returns TransactionRetry if history insufficient.
 	fn validate_write_conflicts(&self) -> Result<()> {
-		self.core
-			.inner
-			.check_keys_conflict(self.write_set.keys().map(|k| k.as_slice()), self.start_seq_num)
+		// Early check: is memtable history sufficient?
+		// If our transaction started before the oldest memtable was created,
+		// we can't reliably check for conflicts (data may have been flushed to SST).
+		let earliest_memtable_seq = self.core.inner.get_earliest_memtable_seq()?;
+		if self.start_seq_num < earliest_memtable_seq {
+			return Err(Error::TransactionRetry);
+		}
+
+		let keys: Vec<&[u8]> = self.write_set.keys().map(|key| key.as_slice()).collect();
+
+		// Ensure no conflicting prepared transaction already owns one of these
+		// keys.
+		self.core.inner.check_prepared_conflicts(keys.iter().copied(), Some(self.txn_id))?;
+
+		// Check all keys in one batch.
+		self.core.inner.check_keys_conflict(keys.into_iter(), self.start_seq_num)
 	}
 
 	pub fn rollback(&mut self) {
-		self.closed = true;
-		self.write_set.clear();
-		self.snapshot.take();
-		self.savepoints = 0;
-		self.write_seqno = 0;
+		if self.prepared.is_some() {
+			// A prepared transaction must remain in-doubt until explicitly
+			// resolved via commit_prepared/rollback_prepared (or tree-level
+			// recovery APIs). Dropping the handle should not release its locks.
+			self.prepared = None;
+			self.closed = true;
+			self.write_set.clear();
+			self.snapshot.take();
+			self.savepoints = 0;
+			self.write_seqno = 0;
+			return;
+		}
+		self.close_transaction();
 	}
 
 	/// After calling this method the subsequent modifications within this
@@ -798,10 +976,7 @@ impl Transaction {
 		if !self.mode.mutable() {
 			return Err(Error::TransactionReadOnly);
 		}
-		// If the transaction is closed, return an error.
-		if self.closed {
-			return Err(Error::TransactionClosed);
-		}
+		self.ensure_active()?;
 
 		// Bump the latest savepoint number.
 		self.savepoints += 1;
@@ -819,10 +994,7 @@ impl Transaction {
 		if !self.mode.mutable() {
 			return Err(Error::TransactionReadOnly);
 		}
-		// If the transaction is closed, return an error.
-		if self.closed {
-			return Err(Error::TransactionClosed);
-		}
+		self.ensure_active()?;
 		// Check that the savepoint is set
 		if self.savepoints == 0 {
 			return Err(Error::TransactionWithoutSavepoint);
@@ -963,9 +1135,7 @@ impl<'a> TransactionRangeIterator<'a> {
 		end_key: Vec<u8>,
 	) -> Result<Self> {
 		// Validate transaction state
-		if tx.closed {
-			return Err(Error::TransactionClosed);
-		}
+		tx.ensure_active()?;
 
 		if tx.mode.is_write_only() {
 			return Err(Error::TransactionWriteOnly);

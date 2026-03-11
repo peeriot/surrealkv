@@ -6,6 +6,7 @@ use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::lsm::fsync_directory;
 use crate::memtable::MemTable;
+use crate::txn_wal::{TxnDecision, TxnWalRecord};
 use crate::wal::reader::{Reader, Reporter};
 use crate::wal::{get_segment_range, list_segment_ids, Error as WalError, SegmentRef};
 
@@ -62,6 +63,52 @@ impl Reporter for DefaultReporter {
 /// * `Ok((None, vec![]))` - No data recovered
 /// * `Err(...)` - Error during replay
 type ReplayResult = (Option<u64>, Vec<(Arc<MemTable>, u64)>);
+
+fn apply_batch_to_memtables(
+	mut current_memtable: Arc<MemTable>,
+	memtables: &mut Vec<(Arc<MemTable>, u64)>,
+	batch: &Batch,
+	segment_id: u64,
+	arena_size: usize,
+	last_added_max_seq: &mut u64,
+) -> Result<Arc<MemTable>> {
+	let batch_highest_seq_num = batch.get_highest_seq_num();
+
+	match current_memtable.add(batch) {
+		Ok(()) => {
+			if batch_highest_seq_num > *last_added_max_seq {
+				*last_added_max_seq = batch_highest_seq_num;
+			}
+		}
+		Err(Error::ArenaFull) => {
+			// Edge case: single segment exceeds memtable capacity
+			if current_memtable.is_empty() {
+				return Err(Error::Other(format!(
+					"Batch too large for memtable (batch size exceeds arena_size={})",
+					arena_size
+				)));
+			}
+			// Save current memtable and create new one
+			log::warn!(
+				"WAL segment #{:020} exceeds single memtable capacity, splitting",
+				segment_id
+			);
+			memtables.push((Arc::clone(&current_memtable), segment_id));
+			current_memtable = Arc::new(MemTable::new(arena_size, *last_added_max_seq));
+
+			// Retry on fresh memtable
+			current_memtable.add(batch)?;
+
+			// Track after successful retry
+			if batch_highest_seq_num > *last_added_max_seq {
+				*last_added_max_seq = batch_highest_seq_num;
+			}
+		}
+		Err(e) => return Err(e),
+	}
+
+	Ok(current_memtable)
+}
 
 pub(crate) fn replay_wal(
 	wal_dir: &Path,
@@ -162,6 +209,65 @@ pub(crate) fn replay_wal(
 			match reader.read() {
 				Ok((record_data, offset)) => {
 					last_valid_offset = offset as usize;
+
+					// 2PC metadata records are not always user data. Prepare records are
+					// metadata-only, while commit decision records may carry a committed batch.
+					if TxnWalRecord::is_txn_record(record_data) {
+						match TxnWalRecord::decode(record_data)? {
+							TxnWalRecord::Prepare(prepare_record) => {
+								log::debug!(
+									"Skipping durable prepare record tx_id={} in WAL #{:020}",
+									prepare_record.txn_id,
+									segment_id
+								);
+							}
+							TxnWalRecord::Decision(decision_record) => {
+								match decision_record.decision {
+									TxnDecision::Commit => {
+										if let Some(batch) = decision_record.committed_batch {
+											let batch_highest_seq_num = batch.get_highest_seq_num();
+											if batch_highest_seq_num > max_seq_num {
+												max_seq_num = batch_highest_seq_num;
+											}
+											batches_in_segment += 1;
+
+											log::debug!(
+												"Replayed committed 2PC decision tx_id={} from WAL #{:020}: seq_num={}, entries={}",
+												decision_record.txn_id,
+												segment_id,
+												batch.starting_seq_num,
+												batch.count()
+											);
+
+											current_memtable = apply_batch_to_memtables(
+												current_memtable,
+												&mut memtables,
+												&batch,
+												segment_id,
+												arena_size,
+												&mut last_added_max_seq,
+											)?;
+										} else {
+											log::debug!(
+												"Skipping legacy 2PC commit decision without batch tx_id={} in WAL #{:020}",
+												decision_record.txn_id,
+												segment_id
+											);
+										}
+									}
+									TxnDecision::Abort => {
+										log::debug!(
+											"Skipping 2PC abort decision tx_id={} in WAL #{:020}",
+											decision_record.txn_id,
+											segment_id
+										);
+									}
+								}
+							}
+						}
+						continue;
+					}
+
 					let batch = Batch::decode(record_data)?;
 					let batch_highest_seq_num = batch.get_highest_seq_num();
 
@@ -179,38 +285,14 @@ pub(crate) fn replay_wal(
 						offset
 					);
 
-					// Apply batch to current memtable with ArenaFull handling
-					match current_memtable.add(&batch) {
-						Ok(()) => {
-							if batch_highest_seq_num > last_added_max_seq {
-								last_added_max_seq = batch_highest_seq_num;
-							}
-						}
-						Err(Error::ArenaFull) => {
-							// Edge case: single segment exceeds memtable capacity
-							if current_memtable.is_empty() {
-								return Err(Error::Other(format!(
-									"Batch too large for memtable (batch size exceeds arena_size={})",
-									arena_size
-								)));
-							}
-							// Save current memtable and create new one
-							log::warn!(
-								"WAL segment #{:020} exceeds single memtable capacity, splitting",
-								segment_id
-							);
-							memtables.push((Arc::clone(&current_memtable), segment_id));
-							current_memtable =
-								Arc::new(MemTable::new(arena_size, last_added_max_seq));
-							// Retry on fresh memtable
-							current_memtable.add(&batch)?;
-							// Track after successful retry
-							if batch_highest_seq_num > last_added_max_seq {
-								last_added_max_seq = batch_highest_seq_num;
-							}
-						}
-						Err(e) => return Err(e),
-					}
+					current_memtable = apply_batch_to_memtables(
+						current_memtable,
+						&mut memtables,
+						&batch,
+						segment_id,
+						arena_size,
+						&mut last_added_max_seq,
+					)?;
 				}
 				Err(WalError::Corruption(err)) => {
 					log::error!(
