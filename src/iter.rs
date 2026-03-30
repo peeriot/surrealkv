@@ -1023,6 +1023,15 @@ impl<'a> CompactionIterator<'a> {
 		// REPLACE semantics: delete all older versions regardless of retention
 		let has_set_with_delete = self.accumulated_versions.iter().any(|(key, _)| key.is_replace());
 
+		// Collect timestamps that have been erased.
+		// Erase entries and the versions at their timestamps are both droppable.
+		let erased_timestamps: Vec<u64> = self
+			.accumulated_versions
+			.iter()
+			.filter(|(key, _)| key.is_erase())
+			.map(|(key, _)| key.timestamp)
+			.collect();
+
 		// Track the visibility of the previous (newer) version we processed.
 		// Used to detect when a newer version supersedes an older one.
 		let mut newer_version_visibility: Option<SnapshotVisibility> = None;
@@ -1033,6 +1042,8 @@ impl<'a> CompactionIterator<'a> {
 			let (key, value) = &self.accumulated_versions[i];
 			let is_hard_delete = key.is_hard_delete_marker();
 			let is_replace = key.is_replace();
+			let is_erase = key.is_erase();
+			let is_erased = !is_erase && erased_timestamps.contains(&key.timestamp);
 			let is_latest = i == 0;
 			let seq_num = key.seq_num();
 
@@ -1080,7 +1091,14 @@ impl<'a> CompactionIterator<'a> {
 			// ===== DETERMINE IF ENTRY IS STALE =====
 			// Stale entries are filtered out during compaction
 
-			let should_mark_stale = if superseded {
+			let should_mark_stale = if is_erased {
+				// Version at an erased timestamp: always drop it.
+				true
+			} else if is_erase {
+				// Erase marker: drop at bottom level (no more versions below),
+				// preserve at non-bottom level so reads still skip the erased version.
+				self.is_bottom_level
+			} else if superseded {
 				// Superseded: a newer version in the same visibility boundary
 				// makes this version redundant - safe to drop
 				true

@@ -8,7 +8,7 @@ use tempdir::TempDir;
 use test_log::test;
 
 use crate::transaction::{HistoryOptions, Mode};
-use crate::{Key, LSMIterator, Options, Result, TreeBuilder, Value};
+use crate::{Key, LSMIterator, Options, Result, TreeBuilder, Value, WriteOptions};
 
 fn create_temp_directory() -> TempDir {
 	TempDir::new("test").unwrap()
@@ -3271,4 +3271,168 @@ async fn repro() {
 	// Expected: only the @prefix key should be returned for this range.
 	// Current behavior: this also returns #@prefix:* and reproduces the bug.
 	assert_eq!(seen.len(), 1, "unexpected keys at ts=2 in scope range: {seen:?}");
+}
+
+// ============================================================================
+// Erase markers in the history iterator
+//
+// An `Erase` removes the version of a key at a specific timestamp; reads must
+// fall through to the previous version. The history iterator must honour this:
+// it must neither yield the erase marker itself (which has no value) nor the
+// version at the erased timestamp.
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_history_erase_newest_version_falls_through() {
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set_at(b"key1", b"value1_v1", 100).unwrap();
+			tx.commit().await.unwrap();
+		}
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set_at(b"key1", b"value1_v2", 200).unwrap();
+			tx.commit().await.unwrap();
+		}
+		{
+			let mut tx = store.begin().unwrap();
+			tx.erase_with_options(b"key1", &WriteOptions::new().with_timestamp(Some(200)))
+				.unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		store.flush().unwrap();
+
+		let tx = store.begin().unwrap();
+		let opts = HistoryOptions::new().with_tombstones(true);
+
+		// Forward
+		let mut iter = tx.history_with_options(b"key0", b"key9", &opts).unwrap();
+		let results = collect_history_all(&mut iter).unwrap();
+		assert_eq!(
+			results.len(),
+			1,
+			"with_index={with_index}: erased ts=200 should be gone, only ts=100 remains: {results:?}"
+		);
+		assert_eq!(results[0].1, b"value1_v1");
+		assert_eq!(results[0].2, 100);
+
+		// Reverse
+		let mut iter = tx.history_with_options(b"key0", b"key9", &opts).unwrap();
+		let results = collect_history_reverse(&mut iter).unwrap();
+		assert_eq!(
+			results.len(),
+			1,
+			"with_index={with_index} (reverse): erased ts=200 should be gone: {results:?}"
+		);
+		assert_eq!(results[0].1, b"value1_v1");
+		assert_eq!(results[0].2, 100);
+	}
+}
+
+#[test(tokio::test)]
+async fn test_history_erase_only_version_removes_key() {
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set_at(b"key1", b"value1", 100).unwrap();
+			tx.commit().await.unwrap();
+		}
+		{
+			let mut tx = store.begin().unwrap();
+			tx.erase_with_options(b"key1", &WriteOptions::new().with_timestamp(Some(100)))
+				.unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		store.flush().unwrap();
+
+		let tx = store.begin().unwrap();
+		let opts = HistoryOptions::new().with_tombstones(true);
+		let mut iter = tx.history_with_options(b"key0", b"key9", &opts).unwrap();
+		let results = collect_history_all(&mut iter).unwrap();
+		assert!(
+			results.is_empty(),
+			"with_index={with_index}: erasing the only version should remove it from history: {results:?}"
+		);
+	}
+}
+
+#[test(tokio::test)]
+async fn test_history_erase_ts_range_scoped() {
+	// Mirrors how swarm's `changeset_for` reads history: tombstones on, and a
+	// ts_range pinned to a single timestamp. The erased version at that ts must
+	// not appear (and must not be yielded as a valueless erase marker).
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set_at(b"key1", b"value1", 100).unwrap();
+			tx.set_at(b"key2", b"value2", 100).unwrap();
+			tx.commit().await.unwrap();
+		}
+		{
+			let mut tx = store.begin().unwrap();
+			tx.erase_with_options(b"key1", &WriteOptions::new().with_timestamp(Some(100)))
+				.unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		store.flush().unwrap();
+
+		let tx = store.begin().unwrap();
+		let opts = HistoryOptions::new().with_tombstones(true).with_ts_range(100, 100);
+		let mut iter = tx.history_with_options(b"key0", b"key9", &opts).unwrap();
+		let results = collect_history_all(&mut iter).unwrap();
+
+		assert_eq!(
+			results.len(),
+			1,
+			"with_index={with_index}: only the non-erased key2 should remain at ts=100: {results:?}"
+		);
+		assert_eq!(results[0].0, b"key2");
+		assert_eq!(results[0].1, b"value2");
+	}
+}
+
+#[test(tokio::test)]
+async fn test_history_erase_fully_erased_key_does_not_halt_reverse() {
+	// Reverse iteration visits high keys first. If the highest key is fully
+	// erased, iteration must still continue to lower keys.
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set_at(b"key1", b"value1", 100).unwrap();
+			tx.set_at(b"key9", b"value9", 100).unwrap();
+			tx.commit().await.unwrap();
+		}
+		{
+			let mut tx = store.begin().unwrap();
+			tx.erase_with_options(b"key9", &WriteOptions::new().with_timestamp(Some(100)))
+				.unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		store.flush().unwrap();
+
+		let tx = store.begin().unwrap();
+		let opts = HistoryOptions::new().with_tombstones(true);
+		let mut iter = tx.history_with_options(b"key0", b"keyz", &opts).unwrap();
+		let results = collect_history_reverse(&mut iter).unwrap();
+
+		assert_eq!(
+			results.len(),
+			1,
+			"with_index={with_index}: key1 must survive after fully-erased key9: {results:?}"
+		);
+		assert_eq!(results[0].0, b"key1");
+	}
 }
