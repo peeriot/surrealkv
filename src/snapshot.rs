@@ -335,6 +335,9 @@ impl Snapshot {
 		let mut best_value: Option<Value> = None;
 		let mut best_timestamp: u64 = 0;
 
+		// Timestamps that have been erased — versions at these timestamps are skipped.
+		let mut erased_timestamps: Vec<u64> = Vec::new();
+
 		while iter.valid() {
 			let entry_key = iter.key();
 
@@ -353,13 +356,19 @@ impl Snapshot {
 
 			// Only consider versions at or before the requested timestamp
 			if entry_ts <= timestamp && entry_ts >= best_timestamp {
-				if entry_key.is_tombstone() {
+				if entry_key.is_erase() {
+					// Mark this timestamp as erased — the version here is removed.
+					erased_timestamps.push(entry_ts);
+				} else if erased_timestamps.contains(&entry_ts) {
+					// This version's timestamp was erased — skip it.
+				} else if entry_key.is_tombstone() {
 					// Key was deleted at this timestamp
 					best_value = None;
+					best_timestamp = entry_ts;
 				} else {
 					best_value = Some(self.core.resolve_value(iter.value_encoded()?)?);
+					best_timestamp = entry_ts;
 				}
-				best_timestamp = entry_ts;
 			}
 
 			iter.next()?;

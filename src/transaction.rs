@@ -401,6 +401,27 @@ impl Transaction {
 		Ok(())
 	}
 
+	/// Erase a key at a specific timestamp. The version at that timestamp is
+	/// removed and reads fall through to the previous version.
+	pub fn erase_with_options<K>(&mut self, key: K, options: &WriteOptions) -> Result<()>
+	where
+		K: IntoBytes,
+	{
+		let write_seqno = self.next_write_seqno();
+		let ts = options.timestamp.unwrap_or(Entry::COMMIT_TIME);
+
+		let entry = Entry::new(
+			key,
+			None::<&[u8]>,
+			InternalKeyKind::Erase,
+			self.savepoints,
+			write_seqno,
+			ts,
+		);
+		self.write(entry)?;
+		Ok(())
+	}
+
 	/// Inserts a key-value pairm removing all previous versions.
 	pub fn replace<K, V>(&mut self, key: K, value: V) -> Result<()>
 	where
@@ -460,8 +481,12 @@ impl Transaction {
 					return Ok(None);
 				}
 
-				// Write set entry is visible if its timestamp <= query timestamp
-				if entry.timestamp <= timestamp {
+				// Erase removes the version at its timestamp — fall through to storage
+				// to find the previous version.
+				if entry.kind == InternalKeyKind::Erase {
+					// Don't return early — let the snapshot handle it
+				} else if entry.timestamp <= timestamp {
+					// Write set entry is visible if its timestamp <= query timestamp
 					if entry.is_tombstone() {
 						return Ok(None);
 					}
