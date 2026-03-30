@@ -117,7 +117,7 @@ pub type IterResult = Result<(Key, Option<Value>)>;
 /// The Key type used throughout the LSM tree
 pub type Key = Vec<u8>;
 
-/// The Value type used throughout the LSM tree  
+/// The Value type used throughout the LSM tree
 pub type Value = Vec<u8>;
 
 /// Type alias for version/timestamp values
@@ -707,7 +707,8 @@ fn trailer_to_kind(trailer: u64) -> InternalKeyKind {
 		4 => InternalKeyKind::LogData,
 		5 => InternalKeyKind::RangeDelete,
 		6 => InternalKeyKind::Replace,
-		7 => InternalKeyKind::Separator,
+		7 => InternalKeyKind::Erase,
+		8 => InternalKeyKind::Separator,
 		24 => InternalKeyKind::Max,
 		_ => InternalKeyKind::Invalid,
 	}
@@ -741,6 +742,12 @@ fn is_replace_kind(kind: InternalKeyKind) -> bool {
 	matches!(kind, InternalKeyKind::Replace)
 }
 
+/// Checks if a key kind represents an Erase operation
+#[inline(always)]
+fn is_erase_kind(kind: InternalKeyKind) -> bool {
+	matches!(kind, InternalKeyKind::Erase)
+}
+
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum InternalKeyKind {
@@ -750,8 +757,9 @@ pub enum InternalKeyKind {
 	Merge = 3,
 	LogData = 4,
 	RangeDelete = 5,
-	Replace = 6, // Replaces previous key when versioning is enabled
-	Separator = 7,
+	Replace = 6,  // Replaces previous key when versioning is enabled
+	Erase = 7,    // Erases the version at this timestamp; reads fall through to the previous version
+	Separator = 8,
 	Max = 24, // Leaving space for other kinds
 	Invalid = 191,
 }
@@ -848,6 +856,10 @@ impl InternalKey {
 
 	pub(crate) fn is_replace(&self) -> bool {
 		is_replace_kind(self.kind())
+	}
+
+	pub(crate) fn is_erase(&self) -> bool {
+		is_erase_kind(self.kind())
 	}
 
 	/// Compares this key with another key using timestamp-based ordering
@@ -953,6 +965,11 @@ impl<'a> InternalKeyRef<'a> {
 	#[inline]
 	pub fn is_replace(&self) -> bool {
 		is_replace_kind(self.kind())
+	}
+
+	#[inline]
+	pub fn is_erase(&self) -> bool {
+		is_erase_kind(self.kind())
 	}
 
 	pub(crate) fn to_owned(self) -> InternalKey {

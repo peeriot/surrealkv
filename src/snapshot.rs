@@ -171,6 +171,15 @@ impl Snapshot {
 	/// The search stops at the first version found with seq_num <= snapshot
 	/// seq_num.
 	pub(crate) fn get(&self, key: &[u8]) -> crate::Result<Option<(Value, u64)>> {
+		// When versioning is enabled, `erase_with_options` may have written an
+		// `Erase` entry that masks the latest version at a specific timestamp.
+		// The per-level point-lookup primitives only return the topmost entry
+		// for a key, so they cannot fall through to an older version. Route
+		// through the multi-version path so erase semantics are honored.
+		if self.core.opts.enable_versioning {
+			return self.get_latest_with_erase(key);
+		}
+
 		// self.core.get_internal(key, self.seq_num)
 		// Read lock on the active memtable
 		let memtable_lock = self.core.active_memtable.read()?;
@@ -179,6 +188,11 @@ impl Snapshot {
 		if let Some(item) = memtable_lock.get(key.as_ref(), Some(self.seq_num)) {
 			if item.0.is_tombstone() {
 				return Ok(None); // Key is a tombstone, return None
+			}
+			if item.0.is_erase() {
+				// Without versioning there's no older version to fall through
+				// to; treat the erased version as absent.
+				return Ok(None);
 			}
 			return Ok(Some((item.1, item.0.seq_num()))); // Key found, return the value
 		}
@@ -193,6 +207,9 @@ impl Snapshot {
 			if let Some(item) = memtable.get(key.as_ref(), Some(self.seq_num)) {
 				if item.0.is_tombstone() {
 					return Ok(None); // Key is a tombstone, return None
+				}
+				if item.0.is_erase() {
+					return Ok(None);
 				}
 				return Ok(Some((item.1, item.0.seq_num()))); // Key found, return the value
 			}
@@ -220,6 +237,9 @@ impl Snapshot {
 						if ikey.is_tombstone() {
 							return Ok(None); // Key is a tombstone, return None
 						}
+						if ikey.is_erase() {
+							return Ok(None);
+						}
 						return Ok(Some((item.1, ikey.seq_num()))); // Key found, return the value
 					}
 				}
@@ -239,6 +259,9 @@ impl Snapshot {
 						if ikey.is_tombstone() {
 							return Ok(None); // Key is a tombstone, return None
 						}
+						if ikey.is_erase() {
+							return Ok(None);
+						}
 						return Ok(Some((item.1, ikey.seq_num()))); // Key found, return the value
 					}
 				}
@@ -246,6 +269,60 @@ impl Snapshot {
 		}
 
 		Ok(None) // Key not found in any memtable or table, return None
+	}
+
+	/// Point read at the latest visible version, honoring erase semantics.
+	///
+	/// Used when versioning is enabled. Walks all versions of the key via the
+	/// history iterator, collecting erased timestamps, and returns the
+	/// highest-seq visible entry whose timestamp is not erased — provided that
+	/// entry is not a tombstone.
+	fn get_latest_with_erase(&self, key: &[u8]) -> Result<Option<(Value, u64)>> {
+		let mut iter = self.history_iter(Some(key), None, true, None, None)?;
+		iter.seek_first()?;
+
+		// History iter yields entries for the same user_key in seq-descending
+		// order. Erase entries have higher seq than the Set they erase (an
+		// Erase is necessarily written after the Set), so we will see any
+		// relevant Erase before the Set it erases.
+		let mut erased_timestamps: Vec<u64> = Vec::new();
+
+		while iter.valid() {
+			let entry_key = iter.key();
+
+			if entry_key.user_key() != key {
+				break;
+			}
+
+			if entry_key.seq_num() > self.seq_num {
+				iter.next()?;
+				continue;
+			}
+
+			if entry_key.is_erase() {
+				erased_timestamps.push(entry_key.timestamp());
+				iter.next()?;
+				continue;
+			}
+
+			if erased_timestamps.contains(&entry_key.timestamp()) {
+				iter.next()?;
+				continue;
+			}
+
+			if entry_key.is_tombstone() {
+				return Ok(None);
+			}
+
+			// Return the raw (possibly VLog-pointer-encoded) value. The
+			// caller resolves through VLog. This matches the contract of the
+			// non-versioned path which returns memtable/SST values verbatim.
+			let seq = entry_key.seq_num();
+			let value = iter.value_encoded()?.to_vec();
+			return Ok(Some((value, seq)));
+		}
+
+		Ok(None)
 	}
 
 	/// Creates an iterator for a range scan within the snapshot
@@ -335,6 +412,9 @@ impl Snapshot {
 		let mut best_value: Option<Value> = None;
 		let mut best_timestamp: u64 = 0;
 
+		// Timestamps that have been erased — versions at these timestamps are skipped.
+		let mut erased_timestamps: Vec<u64> = Vec::new();
+
 		while iter.valid() {
 			let entry_key = iter.key();
 
@@ -353,13 +433,19 @@ impl Snapshot {
 
 			// Only consider versions at or before the requested timestamp
 			if entry_ts <= timestamp && entry_ts >= best_timestamp {
-				if entry_key.is_tombstone() {
+				if entry_key.is_erase() {
+					// Mark this timestamp as erased — the version here is removed.
+					erased_timestamps.push(entry_ts);
+				} else if erased_timestamps.contains(&entry_ts) {
+					// This version's timestamp was erased — skip it.
+				} else if entry_key.is_tombstone() {
 					// Key was deleted at this timestamp
 					best_value = None;
+					best_timestamp = entry_ts;
 				} else {
 					best_value = Some(self.core.resolve_value(iter.value_encoded()?)?);
+					best_timestamp = entry_ts;
 				}
-				best_timestamp = entry_ts;
 			}
 
 			iter.next()?;
@@ -940,38 +1026,93 @@ impl SnapshotIterator<'_> {
 	}
 
 	/// Skip to the next valid entry in forward direction.
-	/// Valid = visible, latest version of user key, not a tombstone.
+	///
+	/// Valid = visible, latest non-erased version of user key, not a tombstone.
+	///
+	/// For each new user_key encountered, walks its version chain (newest seq
+	/// first) collecting erased timestamps from `Erase` entries and returning
+	/// the newest visible version whose timestamp is not in the erased set
+	/// (unless that version is a tombstone, in which case the user_key is
+	/// skipped).
 	fn skip_to_valid_forward(&mut self) -> Result<bool> {
-		while self.merge_iter.valid() {
-			let key_ref = self.merge_iter.key();
-
-			// Skip invisible versions (seq_num > snapshot)
-			if !self.is_visible_ref(&key_ref) {
+		'outer: loop {
+			// Phase 1: advance past any entries belonging to a user_key that
+			// has already been resolved by a prior call.
+			while self.merge_iter.valid() {
+				let skip = {
+					let key_ref = self.merge_iter.key();
+					!self.is_visible_ref(&key_ref)
+						|| key_ref.user_key() == self.last_key_fwd.as_slice()
+				};
+				if !skip {
+					break;
+				}
 				self.merge_iter.next()?;
-				continue;
 			}
 
-			// Skip older versions of same user key
-			let user_key = key_ref.user_key();
-			if user_key == self.last_key_fwd.as_slice() {
-				self.merge_iter.next()?;
-				continue;
+			if !self.merge_iter.valid() {
+				return Ok(false);
 			}
 
-			// New user key - remember it (reuses buffer capacity)
+			// Phase 2: we are at the start (highest seq) of a new user_key
+			// chain. Walk the chain to find the winner.
+			let user_key_vec = self.merge_iter.key().user_key().to_vec();
 			self.last_key_fwd.clear();
-			self.last_key_fwd.extend_from_slice(user_key);
+			self.last_key_fwd.extend_from_slice(&user_key_vec);
 
-			// Skip tombstones (but remember we saw this key)
-			if key_ref.is_tombstone() {
-				self.merge_iter.next()?;
-				continue;
+			let mut erased_timestamps: Vec<u64> = Vec::new();
+
+			while self.merge_iter.valid() {
+				let (same_key, is_visible, ts, is_erase, is_tombstone) = {
+					let key_ref = self.merge_iter.key();
+					let same = key_ref.user_key() == user_key_vec.as_slice();
+					if same {
+						(
+							true,
+							self.is_visible_ref(&key_ref),
+							key_ref.timestamp(),
+							key_ref.is_erase(),
+							key_ref.is_tombstone(),
+						)
+					} else {
+						(false, false, 0, false, false)
+					}
+				};
+
+				if !same_key {
+					// Chain exhausted with no winner; continue with next user_key.
+					continue 'outer;
+				}
+
+				if !is_visible {
+					self.merge_iter.next()?;
+					continue;
+				}
+
+				if is_erase {
+					erased_timestamps.push(ts);
+					self.merge_iter.next()?;
+					continue;
+				}
+
+				if erased_timestamps.contains(&ts) {
+					self.merge_iter.next()?;
+					continue;
+				}
+
+				if is_tombstone {
+					// Newest non-erased version is a tombstone: skip user_key.
+					self.merge_iter.next()?;
+					continue 'outer;
+				}
+
+				// Winner: leave merge_iter positioned here.
+				return Ok(true);
 			}
 
-			// Found valid entry
-			return Ok(true);
+			// merge_iter exhausted inside the chain without a winner.
+			return Ok(false);
 		}
-		Ok(false)
 	}
 
 	/// Skip to the next valid entry in backward direction.
@@ -992,66 +1133,117 @@ impl SnapshotIterator<'_> {
 		Ok(false)
 	}
 
-	/// Find the latest visible version of the current user key going backward.
-	/// Backward iteration sees oldest version first (lowest seq_num).
+	/// Find the latest visible non-erased version of the current user key
+	/// going backward. Backward iteration sees oldest version first
+	/// (lowest seq_num).
+	///
+	/// Walks the entire chain of the current user_key, collecting erased
+	/// timestamps from `Erase` entries, and picks the highest-seq visible
+	/// entry whose timestamp is not erased.
 	fn find_latest_visible_backward(&mut self) -> Result<bool> {
 		if !self.merge_iter.valid() {
 			self.has_current_back = false;
 			return Ok(false);
 		}
 
-		let first_key_ref = self.merge_iter.key();
+		let current_user_key: Vec<u8> = self.merge_iter.key().user_key().to_vec();
 
-		// Store the current user key we're examining
-		let current_user_key: Vec<u8> = first_key_ref.user_key().to_vec();
+		// All visible non-erase entries for this user_key. We can't decide the
+		// winner streaming because erase entries may appear later in the walk
+		// (newer seq) and retroactively invalidate earlier candidates.
+		// Stored as (encoded_key, encoded_value, seq, ts).
+		let mut entries: Vec<(Vec<u8>, Vec<u8>, u64, u64)> = Vec::new();
+		let mut erased_timestamps: Vec<u64> = Vec::new();
 
-		// Track the latest visible version
-		let mut latest_key: Option<Vec<u8>> = None;
-		let mut latest_value: Option<Vec<u8>> = None;
-
-		// If first entry is visible, it's a candidate
-		if self.is_visible_ref(&first_key_ref) {
-			latest_key = Some(first_key_ref.encoded().to_vec());
-			latest_value = Some(self.merge_iter.value_encoded()?.to_vec());
+		// Process current position.
+		{
+			let key_ref = self.merge_iter.key();
+			if self.is_visible_ref(&key_ref) {
+				if key_ref.is_erase() {
+					erased_timestamps.push(key_ref.timestamp());
+				} else {
+					entries.push((
+						key_ref.encoded().to_vec(),
+						self.merge_iter.value_encoded()?.to_vec(),
+						key_ref.seq_num(),
+						key_ref.timestamp(),
+					));
+				}
+			}
 		}
 
-		// Keep consuming entries with same user key, looking for newer visible versions
 		loop {
 			self.merge_iter.prev()?;
-
 			if !self.merge_iter.valid() {
 				break;
 			}
 
-			let key_ref = self.merge_iter.key();
-			let user_key = key_ref.user_key();
+			// Different user key — buffer for next call.
+			let (same_key, encoded_key, encoded_value, is_visible, is_erase, seq, ts) = {
+				let key_ref = self.merge_iter.key();
+				let same = key_ref.user_key() == current_user_key.as_slice();
+				if same {
+					(
+						true,
+						key_ref.encoded().to_vec(),
+						self.merge_iter.value_encoded()?.to_vec(),
+						self.is_visible_ref(&key_ref),
+						key_ref.is_erase(),
+						key_ref.seq_num(),
+						key_ref.timestamp(),
+					)
+				} else {
+					(
+						false,
+						key_ref.encoded().to_vec(),
+						self.merge_iter.value_encoded()?.to_vec(),
+						false,
+						false,
+						0,
+						0,
+					)
+				}
+			};
 
-			if user_key != current_user_key.as_slice() {
-				// Different user key - buffer it for next call
+			if !same_key {
 				self.buffered_back_key.clear();
-				self.buffered_back_key.extend_from_slice(key_ref.encoded());
+				self.buffered_back_key.extend_from_slice(&encoded_key);
 				self.buffered_back_value.clear();
-				self.buffered_back_value.extend_from_slice(self.merge_iter.value_encoded()?);
+				self.buffered_back_value.extend_from_slice(&encoded_value);
 				self.has_buffered_back = true;
 				break;
 			}
 
-			// Same user key - check if this is a newer visible version
-			if self.is_visible_ref(&key_ref) {
-				latest_key = Some(key_ref.encoded().to_vec());
-				latest_value = Some(self.merge_iter.value_encoded()?.to_vec());
+			if !is_visible {
+				continue;
+			}
+
+			if is_erase {
+				erased_timestamps.push(ts);
+			} else {
+				entries.push((encoded_key, encoded_value, seq, ts));
 			}
 		}
 
-		// Check if we found a valid (non-tombstone) entry
-		if let (Some(key_bytes), Some(value_bytes)) = (latest_key, latest_value) {
+		// Pick the highest-seq entry whose timestamp isn't in the erased set.
+		let mut winner: Option<(Vec<u8>, Vec<u8>, u64)> = None;
+		for (k, v, seq, ts) in entries {
+			if erased_timestamps.contains(&ts) {
+				continue;
+			}
+			match &winner {
+				Some((_, _, best_seq)) if *best_seq >= seq => {}
+				_ => winner = Some((k, v, seq)),
+			}
+		}
+
+		if let Some((key_bytes, value_bytes, _)) = winner {
 			let key_ref = InternalKeyRef::from_encoded(&key_bytes);
 			if key_ref.is_tombstone() {
-				// Latest visible is tombstone - skip this key, try next
+				// Latest non-erased visible is a tombstone — skip this key.
 				self.has_current_back = false;
 				return self.skip_to_valid_backward();
 			}
-			// Store the found entry in current_back buffers so valid()/key()/value() work
 			self.current_back_key.clear();
 			self.current_back_key.extend_from_slice(&key_bytes);
 			self.current_back_value.clear();
@@ -1060,7 +1252,7 @@ impl SnapshotIterator<'_> {
 			return Ok(true);
 		}
 
-		// No visible version found for this key, try next
+		// No visible non-erased version for this user_key — try next.
 		self.has_current_back = false;
 		self.skip_to_valid_backward()
 	}
