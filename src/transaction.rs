@@ -721,38 +721,19 @@ impl Transaction {
 		match self.write_set.entry(key) {
 			BTreeEntry::Occupied(mut oe) => {
 				let entries = oe.get_mut();
-				// If the latest existing value for this key belongs to the same
-				// savepoint as the value we are about to write, then we can
-				// overwrite it with the new value (same savepoint = same transaction state).
-				// For different savepoints, we add a new entry to support savepoint rollbacks.
-				//
-				// Exception: When using explicit timestamps (set_at), entries with
-				// different timestamps should be preserved as separate versions, not replaced.
-				if let Some(last_entry) = entries.last() {
-					if last_entry.savepoint_no == e.savepoint_no {
-						// Same savepoint - check if timestamps differ
-						// If both have explicit timestamps and they're different,
-						// preserve both as separate versions
-						let last_has_explicit_ts = last_entry.timestamp != Entry::COMMIT_TIME;
-						let new_has_explicit_ts = e.timestamp != Entry::COMMIT_TIME;
-
-						if last_has_explicit_ts
+				// If there's an earlier write modifying the same entry, replace it.
+				let new_has_explicit_ts = e.timestamp != Entry::COMMIT_TIME;
+				let superseded = entries.iter().rposition(|existing| {
+					existing.savepoint_no == e.savepoint_no
+						&& !(existing.timestamp != Entry::COMMIT_TIME
 							&& new_has_explicit_ts
-							&& last_entry.timestamp != e.timestamp
-						{
-							// Different explicit timestamps - keep both versions
-							entries.push(e);
-						} else {
-							// Same timestamp or using commit time - replace
-							*entries.last_mut().unwrap() = e;
-						}
-					} else {
-						// Different savepoint - add new entry
-						entries.push(e);
-					}
-				} else {
-					entries.push(e);
+							&& existing.timestamp != e.timestamp)
+				});
+
+				if let Some(idx) = superseded {
+					entries.remove(idx);
 				}
+				entries.push(e);
 			}
 			BTreeEntry::Vacant(ve) => {
 				ve.insert(vec![e]);
