@@ -412,8 +412,12 @@ impl Snapshot {
 		let mut best_value: Option<Value> = None;
 		let mut best_timestamp: u64 = 0;
 
-		// Timestamps that have been erased — versions at these timestamps are skipped.
-		let mut erased_timestamps: Vec<u64> = Vec::new();
+		// Timestamps already decided. History yields a key's entries seq-descending,
+		// so the first entry we see at a timestamp is its newest (highest-seq) write
+		// and decides that version; later (lower-seq) entries at the same timestamp
+		// must not override it. An Erase decides the version is removed (reads fall
+		// through to an older version); a tombstone decides it is deleted.
+		let mut seen: Vec<u64> = Vec::new();
 
 		while iter.valid() {
 			let entry_key = iter.key();
@@ -431,19 +435,19 @@ impl Snapshot {
 
 			let entry_ts = entry_key.timestamp();
 
-			// Only consider versions at or before the requested timestamp
-			if entry_ts <= timestamp && entry_ts >= best_timestamp {
+			// Only consider versions at or before the requested timestamp, and only
+			// the newest write at each timestamp.
+			if entry_ts <= timestamp && !seen.contains(&entry_ts) {
+				seen.push(entry_ts);
+
 				if entry_key.is_erase() {
-					// Mark this timestamp as erased — the version here is removed.
-					erased_timestamps.push(entry_ts);
-				} else if erased_timestamps.contains(&entry_ts) {
-					// This version's timestamp was erased — skip it.
-				} else if entry_key.is_tombstone() {
-					// Key was deleted at this timestamp
-					best_value = None;
-					best_timestamp = entry_ts;
-				} else {
-					best_value = Some(self.core.resolve_value(iter.value_encoded()?)?);
+					// Version at this timestamp removed — fall through to older.
+				} else if entry_ts >= best_timestamp {
+					best_value = if entry_key.is_tombstone() {
+						None
+					} else {
+						Some(self.core.resolve_value(iter.value_encoded()?)?)
+					};
 					best_timestamp = entry_ts;
 				}
 			}
@@ -1621,46 +1625,6 @@ impl<'a> HistoryIterator<'a> {
 		self.inner.prev()
 	}
 
-	/// Skip all remaining entries for the current user_key.
-	/// Returns true if positioned on a new user_key, false if iterator exhausted.
-	fn skip_to_next_user_key(&mut self) -> Result<bool> {
-		let current = self.current_user_key.clone();
-		while self.inner_valid() {
-			if self.inner_key().user_key() != current.as_slice() {
-				return Ok(true);
-			}
-			self.inner_next()?;
-		}
-		Ok(false)
-	}
-
-	/// With ts_range, seek to (next_user_key, ts_end) to skip entries above range.
-	/// Without ts_range, linearly scan past entries with the same user_key.
-	/// Returns true if positioned on a new user_key, false if iterator exhausted.
-	fn advance_to_next_user_key(&mut self) -> Result<bool> {
-		// Only optimize with ts_range
-		let ts_end = match self.ts_range {
-			Some((_, end)) => end,
-			None => return self.skip_to_next_user_key(),
-		};
-
-		let current = self.current_user_key.clone();
-
-		// Advance to find next user_key
-		while self.inner_valid() {
-			let next_key_vec = self.inner_key().user_key().to_vec();
-			if next_key_vec != current {
-				// Found next key - seek to (next_key, ts_end) to skip entries above range
-				let seek_key =
-					InternalKey::new(next_key_vec, u64::MAX, InternalKeyKind::Set, ts_end);
-				self.inner.seek(&seek_key.encode())?;
-				return Ok(self.inner_valid());
-			}
-			self.inner_next()?;
-		}
-		Ok(false)
-	}
-
 	// --- Bounds checking ---
 	// KMergeIterator handles bounds via InternalKeyRange, but upper_bound
 	// is still needed for the merged bplustree path where the bplustree
@@ -1755,12 +1719,11 @@ impl<'a> HistoryIterator<'a> {
 					continue;
 				}
 				if timestamp < ts_start {
-					// Below range - all remaining entries for this key are also below
-					// (timestamps are ordered descending within a key).
-					// Skip to next user_key with optimization for B+tree.
-					if !self.advance_to_next_user_key()? {
-						return Ok(false);
-					}
+					// Below range - skip just this entry. We can't skip the whole key:
+					// entries run descending by seq, not by timestamp, so a version
+					// re-inserted at an older timestamp (newer seq) can appear before an
+					// in-range version of the same key.
+					self.inner_next()?;
 					continue;
 				}
 			}
