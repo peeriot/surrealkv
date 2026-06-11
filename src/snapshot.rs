@@ -358,8 +358,13 @@ impl Snapshot {
 
 			let entry_ts = entry_key.timestamp();
 
-			// Only consider versions at or before the requested timestamp
-			if entry_ts <= timestamp && entry_ts >= best_timestamp {
+			// Only consider versions at or before the requested timestamp.
+			// Strict `>` (not `>=`) makes ties at an equal timestamp resolve by
+			// last-write-wins: the merge yields versions newest-seqno-first, so the
+			// first one seen at the winning timestamp (the highest seqno = latest
+			// write) is kept and later same-timestamp versions are ignored. This
+			// lets a delete and a re-insert at the same timestamp behave correctly.
+			if entry_ts <= timestamp && entry_ts > best_timestamp {
 				if entry_key.is_tombstone() {
 					// Key was deleted at this timestamp
 					best_value = None;
@@ -373,6 +378,169 @@ impl Snapshot {
 		}
 
 		Ok(best_value)
+	}
+
+	/// Collapses every user key in `[lower, upper)` to the single version
+	/// visible as of `read_ts`, applying *identical* rules to [`Snapshot::get_at`]:
+	/// the newest version with `timestamp <= read_ts` that is visible to this
+	/// snapshot's `seq_num`, with HARD_DELETE/REPLACE barriers applied by the
+	/// underlying history iterator. Keys whose visible version is a tombstone
+	/// (or which have no visible version) are omitted.
+	///
+	/// Returns committed entries sorted ascending by user key, each as
+	/// `(encoded_internal_key, resolved_value)`.
+	pub(crate) fn collapse_range_at(
+		&self,
+		lower: Option<&[u8]>,
+		upper: Option<&[u8]>,
+		read_ts: u64,
+	) -> Result<Vec<(Vec<u8>, Value)>> {
+		// Mirror get_at's call shape exactly (no ts_range, include_tombstones=true)
+		// so that barrier handling and version visibility are identical.
+		let mut iter = self.history_iter(lower, upper, true, None, None)?;
+		iter.seek_first()?;
+
+		let mut entries: Vec<(Vec<u8>, Value)> = Vec::new();
+
+		// Per-user-key accumulator. History yields (user_key ASC, seq DESC).
+		let mut cur_key: Vec<u8> = Vec::new();
+		let mut have_group = false;
+		let mut best_ts: u64 = 0;
+		let mut best_is_tombstone = false;
+		let mut best_key_enc: Vec<u8> = Vec::new();
+		let mut best_value: Value = Vec::new();
+		let mut have_best = false;
+
+		while iter.valid() {
+			let (user_key, seq_num, ts, is_tomb) = {
+				let k = iter.key();
+				(k.user_key().to_vec(), k.seq_num(), k.timestamp(), k.is_tombstone())
+			};
+
+			// New user key: flush the previous group, then reset.
+			if !have_group || user_key != cur_key {
+				if have_best && !best_is_tombstone {
+					entries.push((
+						std::mem::take(&mut best_key_enc),
+						std::mem::take(&mut best_value),
+					));
+				}
+				cur_key = user_key;
+				have_group = true;
+				best_ts = 0;
+				best_is_tombstone = false;
+				have_best = false;
+			}
+
+			// Skip versions not visible to this snapshot (same as get_at).
+			if seq_num > self.seq_num {
+				iter.next()?;
+				continue;
+			}
+
+			// Same rule as get_at: newest version with ts <= read_ts wins, and
+			// strict `>` makes equal-timestamp ties resolve by last-write-wins
+			// (highest seqno, seen first in the newest-seqno-first merge).
+			if ts <= read_ts && ts > best_ts {
+				best_ts = ts;
+				best_is_tombstone = is_tomb;
+				best_value = if is_tomb {
+					Vec::new()
+				} else {
+					self.core.resolve_value(iter.value_encoded()?)?
+				};
+				best_key_enc = iter.key().encoded().to_vec();
+				have_best = true;
+			}
+
+			iter.next()?;
+		}
+
+		// Flush the final group.
+		if have_best && !best_is_tombstone {
+			entries.push((best_key_enc, best_value));
+		}
+
+		Ok(entries)
+	}
+}
+
+/// A cursor over a materialized set of `(encoded_internal_key, value)` entries
+/// produced by an as-of-timestamp range collapse. Entries are sorted ascending
+/// by user key, so forward/backward iteration is a simple index walk.
+///
+// PERF: this materializes the collapsed range up front. The collapse itself is
+// guaranteed equivalent to running `get_at` on each key (see `collapse_range_at`),
+// which makes it a safe correctness oracle for a future streaming implementation.
+pub(crate) struct VersionedRangeIterator {
+	entries: Vec<(Vec<u8>, Value)>,
+	pos: Option<usize>,
+}
+
+impl VersionedRangeIterator {
+	pub(crate) fn new(entries: Vec<(Vec<u8>, Value)>) -> Self {
+		Self {
+			entries,
+			pos: None,
+		}
+	}
+}
+
+impl LSMIterator for VersionedRangeIterator {
+	fn seek(&mut self, target: &[u8]) -> Result<bool> {
+		let target_user_key = InternalKeyRef::from_encoded(target).user_key().to_vec();
+		self.pos = self.entries.iter().position(|(enc, _)| {
+			InternalKeyRef::from_encoded(enc).user_key() >= target_user_key.as_slice()
+		});
+		Ok(self.pos.is_some())
+	}
+
+	fn seek_first(&mut self) -> Result<bool> {
+		self.pos = if self.entries.is_empty() {
+			None
+		} else {
+			Some(0)
+		};
+		Ok(self.pos.is_some())
+	}
+
+	fn seek_last(&mut self) -> Result<bool> {
+		self.pos = if self.entries.is_empty() {
+			None
+		} else {
+			Some(self.entries.len() - 1)
+		};
+		Ok(self.pos.is_some())
+	}
+
+	fn next(&mut self) -> Result<bool> {
+		self.pos = match self.pos {
+			Some(p) if p + 1 < self.entries.len() => Some(p + 1),
+			_ => None,
+		};
+		Ok(self.pos.is_some())
+	}
+
+	fn prev(&mut self) -> Result<bool> {
+		self.pos = match self.pos {
+			Some(p) if p > 0 => Some(p - 1),
+			_ => None,
+		};
+		Ok(self.pos.is_some())
+	}
+
+	fn valid(&self) -> bool {
+		self.pos.is_some()
+	}
+
+	fn key(&self) -> InternalKeyRef<'_> {
+		let pos = self.pos.expect("key() called on invalid VersionedRangeIterator");
+		InternalKeyRef::from_encoded(&self.entries[pos].0)
+	}
+
+	fn value_encoded(&self) -> Result<&[u8]> {
+		let pos = self.pos.expect("value_encoded() called on invalid VersionedRangeIterator");
+		Ok(&self.entries[pos].1)
 	}
 }
 

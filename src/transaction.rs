@@ -1,14 +1,17 @@
 use std::cmp::Ordering;
 use std::collections::btree_map::Entry as BTreeEntry;
 use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::sync::Arc;
 
 use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::lsm::Core;
-use crate::snapshot::{HistoryIterator, MergeDirection, Snapshot, SnapshotIterator};
+use crate::snapshot::{
+	HistoryIterator, MergeDirection, Snapshot, SnapshotIterator, VersionedRangeIterator,
+};
 use crate::tracker::ActiveTxnGuard;
-use crate::{InternalKeyKind, InternalKeyRef, IntoBytes, Key, LSMIterator, Value};
+use crate::{InternalKey, InternalKeyKind, InternalKeyRef, IntoBytes, Key, LSMIterator, Value};
 
 /// `Mode` is an enumeration representing the different modes a transaction can
 /// have in an MVCC (Multi-Version Concurrency Control) system.
@@ -556,6 +559,95 @@ impl Transaction {
 		let start_key = options.lower_bound.clone().unwrap_or_default();
 		let end_key = options.upper_bound.clone().unwrap_or_default();
 		TransactionRangeIterator::new_with_options(self, Arc::clone(&self.core), start_key, end_key)
+	}
+
+	/// Gets keys and values in a range, as of a specific timestamp.
+	///
+	/// For each user key in `[start, end)`, yields the single version visible
+	/// as of `read_ts` — the newest version with `timestamp <= read_ts`, with the
+	/// same collapse/barrier/RYOW semantics as [`Transaction::get_at`]. Keys whose
+	/// visible version is a tombstone (soft-delete) are omitted, and hard-deleted
+	/// keys are omitted entirely.
+	pub fn range_at<K>(&self, start: K, end: K, read_ts: u64) -> Result<impl LSMIterator + '_>
+	where
+		K: IntoBytes,
+	{
+		let mut options = ReadOptions::default();
+		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
+		self.range_at_with_options(&options, read_ts)
+	}
+
+	/// Gets keys and values in a range as of a specific timestamp, with custom
+	/// read options. See [`Transaction::range_at`].
+	pub fn range_at_with_options(
+		&self,
+		options: &ReadOptions,
+		read_ts: u64,
+	) -> Result<impl LSMIterator + '_> {
+		if self.closed {
+			return Err(Error::TransactionClosed);
+		}
+		if self.mode.is_write_only() {
+			return Err(Error::TransactionWriteOnly);
+		}
+		if !self.core.opts.enable_versioning {
+			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+		}
+
+		let lower = options.lower_bound.as_deref();
+		let upper = options.upper_bound.as_deref();
+
+		let snapshot = self.snapshot.as_ref().ok_or(Error::NoSnapshot)?;
+		let committed = snapshot.collapse_range_at(lower, upper, read_ts)?;
+
+		// Index the committed (as-of read_ts) results by user key so the
+		// transaction's own uncommitted writes can override them.
+		let mut by_user_key: BTreeMap<Vec<u8>, (Vec<u8>, Value)> = BTreeMap::new();
+		for (enc_key, value) in committed {
+			let user_key = InternalKeyRef::from_encoded(&enc_key).user_key().to_vec();
+			by_user_key.insert(user_key, (enc_key, value));
+		}
+
+		// RYOW: merge the transaction's own uncommitted writes using the same
+		// visibility rule as `get_at`'s write-set branch:
+		//   - a hard delete removes the key regardless of timestamp;
+		//   - an entry with timestamp <= read_ts wins (tombstone removes the key,
+		//     otherwise its value overrides the committed one);
+		//   - an entry with timestamp > read_ts is "from the future" and ignored,
+		//     leaving the committed as-of value in place.
+		let lo = match lower {
+			Some(l) => Bound::Included(l.to_vec()),
+			None => Bound::Unbounded,
+		};
+		let hi = match upper {
+			Some(u) => Bound::Excluded(u.to_vec()),
+			None => Bound::Unbounded,
+		};
+		for (key, entries) in self.write_set.range((lo, hi)) {
+			let Some(entry) = entries.last() else {
+				continue;
+			};
+
+			if entry.is_hard_delete() {
+				by_user_key.remove(key);
+			} else if entry.timestamp <= read_ts {
+				if entry.is_tombstone() {
+					by_user_key.remove(key);
+				} else {
+					let enc = InternalKey::new(
+						key.clone(),
+						entry.seqno as u64,
+						entry.kind,
+						entry.timestamp,
+					)
+					.encode();
+					by_user_key.insert(key.clone(), (enc, entry.value.clone().unwrap_or_default()));
+				}
+			}
+		}
+
+		let entries: Vec<(Vec<u8>, Value)> = by_user_key.into_values().collect();
+		Ok(VersionedRangeIterator::new(entries))
 	}
 
 	/// Returns a unified history iterator over ALL versions of keys in the range.

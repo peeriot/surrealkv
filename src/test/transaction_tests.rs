@@ -1924,6 +1924,153 @@ async fn test_versioned_queries_basic() {
 }
 
 #[test(tokio::test)]
+async fn test_range_at_returns_version_visible_as_of_timestamp() {
+	let temp_dir = create_temp_directory();
+	let opts: Options =
+		Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
+	let tree = TreeBuilder::with_options(opts).build().unwrap();
+
+	// key1: v1@100, v2@200 ; key2: vA@150
+	let mut tx = tree.begin().unwrap();
+	tx.set_at(b"key1", b"value1_v1", 100).unwrap();
+	tx.commit().await.unwrap();
+
+	let mut tx = tree.begin().unwrap();
+	tx.set_at(b"key1", b"value1_v2", 200).unwrap();
+	tx.set_at(b"key2", b"value2_vA", 150).unwrap();
+	tx.commit().await.unwrap();
+
+	let tx = tree.begin().unwrap();
+
+	// As of ts=100: only key1's first version exists; key2 not yet present.
+	let at_100 = collect_transaction_all(&mut tx.range_at(b"key1", b"key3", 100).unwrap()).unwrap();
+	assert_eq!(at_100, vec![(b"key1".to_vec(), b"value1_v1".to_vec())]);
+
+	// As of ts=150: key1 still v1, key2 now present.
+	let at_150 = collect_transaction_all(&mut tx.range_at(b"key1", b"key3", 150).unwrap()).unwrap();
+	assert_eq!(
+		at_150,
+		vec![
+			(b"key1".to_vec(), b"value1_v1".to_vec()),
+			(b"key2".to_vec(), b"value2_vA".to_vec()),
+		]
+	);
+
+	// As of ts=200: key1 upgraded to v2.
+	let at_200 = collect_transaction_all(&mut tx.range_at(b"key1", b"key3", 200).unwrap()).unwrap();
+	assert_eq!(
+		at_200,
+		vec![
+			(b"key1".to_vec(), b"value1_v2".to_vec()),
+			(b"key2".to_vec(), b"value2_vA".to_vec()),
+		]
+	);
+}
+
+#[test(tokio::test)]
+async fn test_range_at_agrees_with_get_at_including_ryow() {
+	let temp_dir = create_temp_directory();
+	let opts: Options =
+		Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
+	let tree = TreeBuilder::with_options(opts).build().unwrap();
+
+	// Committed history.
+	let mut tx = tree.begin().unwrap();
+	tx.set_at(b"key_a", b"a_v1", 100).unwrap();
+	tx.set_at(b"key_b", b"b_v1", 100).unwrap();
+	tx.set_at(b"key_c", b"c_v1", 100).unwrap();
+	tx.commit().await.unwrap();
+
+	let mut tx = tree.begin().unwrap();
+	tx.set_at(b"key_a", b"a_v2", 200).unwrap();
+	tx.commit().await.unwrap();
+
+	// A read-write transaction with uncommitted writes (RYOW).
+	let mut tx = tree.begin().unwrap();
+	tx.set_at(b"key_b", b"b_uncommitted", 150).unwrap(); // override, visible at ts>=150
+	tx.soft_delete_with_options(b"key_c", &WriteOptions::new().with_timestamp(Some(150)))
+		.unwrap(); // delete, hidden at ts>=150
+	tx.set_at(b"key_d", b"d_future", 500).unwrap(); // future write, ts > read_ts
+
+	let read_ts = 300u64;
+
+	// Explicit expectation: a=a_v2 (committed), b=b_uncommitted (RYOW),
+	// c omitted (RYOW tombstone), d omitted (future write ignored).
+	let scanned =
+		collect_transaction_all(&mut tx.range_at(b"key_a", b"key_e", read_ts).unwrap()).unwrap();
+	assert_eq!(
+		scanned,
+		vec![
+			(b"key_a".to_vec(), b"a_v2".to_vec()),
+			(b"key_b".to_vec(), b"b_uncommitted".to_vec()),
+		]
+	);
+
+	// Invariant: range_at must agree with get_at key-by-key (get_at already does RYOW).
+	for key in [&b"key_a"[..], b"key_b", b"key_c", b"key_d", b"key_e"] {
+		let point = tx.get_at(key, read_ts).unwrap();
+		let scanned_val = scanned.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
+		assert_eq!(scanned_val, point, "range_at disagrees with get_at for {key:?}");
+	}
+}
+
+#[test(tokio::test)]
+async fn test_range_at_committed_soft_delete_boundary() {
+	let temp_dir = create_temp_directory();
+	let opts: Options =
+		Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
+	let tree = TreeBuilder::with_options(opts).build().unwrap();
+
+	let mut tx = tree.begin().unwrap();
+	tx.set_at(b"k1", b"v1", 100).unwrap();
+	tx.set_at(b"k2", b"keep", 100).unwrap();
+	tx.commit().await.unwrap();
+
+	// Soft-delete k1 at ts=200 (committed).
+	let mut tx = tree.begin().unwrap();
+	tx.soft_delete_with_options(b"k1", &WriteOptions::new().with_timestamp(Some(200))).unwrap();
+	tx.commit().await.unwrap();
+
+	let tx = tree.begin().unwrap();
+
+	// Before the delete: k1 still visible.
+	let before = collect_transaction_all(&mut tx.range_at(b"k1", b"k3", 150).unwrap()).unwrap();
+	assert_eq!(
+		before,
+		vec![(b"k1".to_vec(), b"v1".to_vec()), (b"k2".to_vec(), b"keep".to_vec())]
+	);
+
+	// After the delete: k1 omitted, earlier-versioned reads still work for k2.
+	let after = collect_transaction_all(&mut tx.range_at(b"k1", b"k3", 250).unwrap()).unwrap();
+	assert_eq!(after, vec![(b"k2".to_vec(), b"keep".to_vec())]);
+}
+
+#[test(tokio::test)]
+async fn test_range_at_reverse_iteration() {
+	let temp_dir = create_temp_directory();
+	let opts: Options =
+		Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
+	let tree = TreeBuilder::with_options(opts).build().unwrap();
+
+	let mut tx = tree.begin().unwrap();
+	tx.set_at(b"k1", b"v1", 100).unwrap();
+	tx.set_at(b"k2", b"v2", 100).unwrap();
+	tx.set_at(b"k3", b"v3", 100).unwrap();
+	tx.commit().await.unwrap();
+
+	let tx = tree.begin().unwrap();
+	let rev = collect_transaction_reverse(&mut tx.range_at(b"k1", b"k4", 200).unwrap()).unwrap();
+	assert_eq!(
+		rev,
+		vec![
+			(b"k3".to_vec(), b"v3".to_vec()),
+			(b"k2".to_vec(), b"v2".to_vec()),
+			(b"k1".to_vec(), b"v1".to_vec()),
+		]
+	);
+}
+
+#[test(tokio::test)]
 async fn test_versioned_queries_with_deletes() {
 	let temp_dir = create_temp_directory();
 	let opts: Options =
